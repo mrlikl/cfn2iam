@@ -20,7 +20,7 @@ license-files = [
 ]
 keywords = ["aws, cloudformation, iam, permissions"]
 dependencies = [
-    "boto3",
+    "botocore",
     "pyyaml",
     "typer"
 ]

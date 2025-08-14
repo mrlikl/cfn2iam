@@ -24,27 +24,19 @@ This tool analyzes CloudFormation templates to identify all resource types used,
 ## Installation
 
 ```bash
-git clone https://github.com/mrlikl/cfn2iam.git
-cd cfn2iam
-uv sync
+pip install cfn2iam
 ```
 
 ## Usage
 
 ```bash
-python source/app.py <template_file> [options]
-# or using shorthand options
-python source/app.py -t <template_file> [options]
+cfn2iam <template_path> [options]
 ```
-
-### Arguments
-
-- `template_file` or `-t, --template-file`: Path to the CloudFormation template file (JSON or YAML)
 
 ### Options
 
-- `-d, --allow-delete`: Allow delete permissions instead of denying them
-- `-c, --create-role`: Create an IAM role with the generated permissions (default: True)
+- `-d, --allow-delete`: Allow delete permissions instead of denying them (default: False)
+- `-c, --create-role`: Create an IAM role with the generated permissions (default: False)
 - `-r, --role-name`: Name for the IAM role (if not specified, uses 'cfn2iam-<random_hash>')
 - `-p, --permissions-boundary`: ARN of the permissions boundary to attach to the role
 
@@ -52,29 +44,22 @@ python source/app.py -t <template_file> [options]
 
 Generate a policy document from a template:
 ```bash
-python source/app.py path/to/template.yaml
-# or
-python source/app.py -t path/to/template.yaml
-```
-
-Create an IAM role with delete permissions denied (default behavior):
-```bash
-python source/app.py path/to/template.yaml
+cfn2iam path/to/template.yaml
 ```
 
 Create an IAM role with delete permissions allowed:
 ```bash
-python source/app.py path/to/template.yaml -d
+cfn2iam path/to/template.yaml -d
 ```
 
 Create an IAM role with a custom name:
 ```bash
-python source/app.py path/to/template.yaml -r MyCustomRole
+cfn2iam path/to/template.yaml -r MyCustomRole
 ```
 
 Create an IAM role with a permissions boundary:
 ```bash
-python source/app.py path/to/template.yaml -p arn:aws:iam::123456789012:policy/boundary
+cfn2iam path/to/template.yaml -p arn:aws:iam::123456789012:policy/boundary
 ```
 
 ## How It Works

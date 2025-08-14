@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import boto3
+import botocore.session
 import typer
 import json
 import yaml
@@ -66,7 +66,8 @@ def parse_cloudformation_template(file_path):
 
 
 def get_permissions(resourcetype):
-    cfn_client = boto3.client('cloudformation')
+    session = botocore.session.get_session()
+    cfn_client = session.create_client('cloudformation')
     response = cfn_client.describe_type(Type='RESOURCE', TypeName=resourcetype)
     data = json.loads(response['Schema'])
 
@@ -128,7 +129,8 @@ def generate_policy_document(all_update_permissions, all_delete_permissions, all
 
 
 def create_iam_role(policy_document, role_name, permissions_boundary=None):
-    iam_client = boto3.client('iam')
+    session = botocore.session.get_session()
+    iam_client = session.create_client('iam')
     trust_policy = {
         "Version": "2012-10-17",
         "Statement": [
@@ -166,7 +168,7 @@ def create_iam_role(policy_document, role_name, permissions_boundary=None):
         return None
 
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, add_completion=False)
 
 
 @app.command()
@@ -184,7 +186,7 @@ def main(
     version: Optional[bool] = typer.Option(
         None, "--version", callback=version_callback, help="Show version and exit")
 ):
-    """Generate IAM permissions for CloudFormation resources."""
+    """A tool to automatically generate minimal IAM policy to deploy a CloudFormation stack from its template."""
     try:
         print(f"Parsing CloudFormation template: {template_path}")
         resource_types = parse_cloudformation_template(template_path)
