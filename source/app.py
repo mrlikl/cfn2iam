@@ -65,6 +65,8 @@ def evaluate_condition(condition, resource_properties):
         return True
     elif condition == "properties.Role == null":
         return resource_properties.get('Role') is None
+    elif condition == "properties.StageName == null":
+        return resource_properties.get('StageName') is None
     elif "properties.DeploymentPreference.Role == null" in condition:
         dp = resource_properties.get('DeploymentPreference', {})
         return dp.get('Role') is None if dp else False

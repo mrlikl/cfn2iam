@@ -9,12 +9,12 @@
       "resources": ["AWS::IAM::Role"]
     },
     {
-      "condition": "properties.Events",
-      "resources": ["AWS::Events::Rule"]
+      "condition": "properties.Events.*.Type == 'Api' && properties.Events.*.Properties.RestApiId == null",
+      "resources": ["AWS::ApiGateway::RestApi"]
     },
     {
-      "condition": "properties.Logging",
-      "resources": ["AWS::Logs::LogGroup"]
+      "condition": "properties.Events.*.Type in ['EventBridgeRule', 'Schedule', 'CloudWatchEvents']",
+      "resources": ["AWS::Events::Rule"]
     }
   ]
 }
