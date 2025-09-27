@@ -39,17 +39,22 @@ wheels = [
 name = "cfn2iam"
 source = { editable = "." }
 dependencies = [
-    { name = "boto3" },
     { name = "pyyaml" },
     { name = "typer" },
 ]
 
+[package.optional-dependencies]
+iam = [
+    { name = "boto3" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "boto3" },
+    { name = "boto3", marker = "extra == 'iam'" },
     { name = "pyyaml" },
     { name = "typer" },
 ]
+provides-extras = ["iam"]
 
 [[package]]
 name = "click"

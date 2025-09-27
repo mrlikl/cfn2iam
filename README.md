@@ -20,13 +20,18 @@ This tool analyzes CloudFormation templates to identify all resource types used,
 ## Prerequisites
 
 - Python 3.9+
-- AWS CLI configured (only required for IAM role creation with `-c` flag)
 - [uv package manager](https://docs.astral.sh/uv/getting-started/installation/)
+- boto3 (only required for IAM role creation with `-c` flag): `pip install boto3`
 
 ## Installation
 
 ```bash
 pip install cfn2iam
+```
+
+For IAM role creation functionality:
+```bash
+pip install cfn2iam[iam]
 ```
 
 ## Usage

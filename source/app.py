@@ -140,7 +140,12 @@ def generate_policy_document(all_update_permissions, all_delete_permissions, all
 
 
 def create_iam_role(policy_document, role_name, permissions_boundary=None):
-    import boto3
+    try:
+        import boto3
+    except ImportError:
+        print("Error: boto3 is required for IAM role creation. Install with: pip install boto3")
+        return None
+        
     iam_client = boto3.client('iam')
     trust_policy = {
         "Version": "2012-10-17",
