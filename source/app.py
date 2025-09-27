@@ -37,6 +37,29 @@ def ignore_unknown_tags(loader, tag_suffix, node):
 yaml.SafeLoader.add_multi_constructor('!', ignore_unknown_tags)
 
 
+def map_sam_resources(resource_types):
+    """Map SAM resources to their underlying CloudFormation resources"""
+    sam_mapping = {
+        'AWS::Serverless::Function': ['AWS::Lambda::Function', 'AWS::IAM::Role', 'AWS::Logs::LogGroup'],
+        'AWS::Serverless::Api': ['AWS::ApiGateway::RestApi', 'AWS::ApiGateway::Deployment', 'AWS::ApiGateway::Stage'],
+        'AWS::Serverless::HttpApi': ['AWS::ApiGatewayV2::Api', 'AWS::ApiGatewayV2::Stage'],
+        'AWS::Serverless::SimpleTable': ['AWS::DynamoDB::Table'],
+        'AWS::Serverless::Application': [],  # Skip nested applications
+        'AWS::Serverless::LayerVersion': ['AWS::Lambda::LayerVersion'],
+        'AWS::Serverless::StateMachine': ['AWS::StepFunctions::StateMachine', 'AWS::IAM::Role']
+    }
+    
+    mapped_resources = set()
+    for resource_type in resource_types:
+        if resource_type in sam_mapping:
+            mapped_resources.update(sam_mapping[resource_type])
+            print(f"Mapped SAM resource {resource_type} to {sam_mapping[resource_type]}")
+        else:
+            mapped_resources.add(resource_type)
+    
+    return mapped_resources
+
+
 def parse_cloudformation_template(file_path):
     with open(file_path, 'r') as file:
         if file_path.endswith('.json'):
@@ -63,7 +86,9 @@ def parse_cloudformation_template(file_path):
             resource_type = resource['Type']
             if not any(re.match(pattern, resource_type) for pattern in ignore_patterns):
                 resource_types.add(resource_type)
-    return resource_types
+    
+    # Map SAM resources to CloudFormation resources
+    return map_sam_resources(resource_types)
 
 
 def get_permissions(resourcetype):
