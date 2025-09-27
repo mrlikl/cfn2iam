@@ -1,0 +1,49 @@
+{
+  "version": "1.0",
+  "resource_type": "AWS::Serverless::StateMachine",
+  "base_resources": ["AWS::StepFunctions::StateMachine"],
+  "conditional_resources": [
+    {
+      "condition": { "path": "properties.Role", "op": "is_null" },
+      "resources": ["AWS::IAM::Role"]
+    },
+    {
+      "condition": {
+        "path": "properties.Events.*.Type",
+        "op": "any_eq",
+        "value": "Api"
+      },
+      "resources": ["AWS::ApiGateway::RestApi"]
+    },
+    {
+      "condition": {
+        "path": "properties.Events.*.Type",
+        "op": "any_eq",
+        "value": "EventBridgeRule"
+      },
+      "resources": ["AWS::Events::Rule"]
+    },
+    {
+      "condition": {
+        "path": "properties.Events.*.Type",
+        "op": "any_eq",
+        "value": "Schedule"
+      },
+      "resources": ["AWS::Events::Rule"]
+    },
+    {
+      "condition": {
+        "path": "properties.Events.*.Type",
+        "op": "any_eq",
+        "value": "CloudWatchEvents"
+      },
+      "resources": ["AWS::Events::Rule"]
+    }
+  ],
+  "logical_id_templates": [
+    "<statemachine-logical-id>",
+    "<statemachine-logical-id>Role",
+    "ServerlessRestApi",
+    "<statemachine-logical-id><event-logical-id>"
+  ]
+}

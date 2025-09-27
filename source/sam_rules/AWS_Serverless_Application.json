@@ -1,0 +1,7 @@
+{
+  "version": "1.0",
+  "resource_type": "AWS::Serverless::Application",
+  "base_resources": ["AWS::CloudFormation::Stack"],
+  "conditional_resources": [],
+  "logical_id_templates": ["<application-logical-id>"]
+}

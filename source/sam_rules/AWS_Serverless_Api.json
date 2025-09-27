@@ -1,0 +1,40 @@
+{
+  "version": "1.0",
+  "resource_type": "AWS::Serverless::Api",
+  "base_resources": [
+    "AWS::ApiGateway::RestApi",
+    "AWS::ApiGateway::Stage",
+    "AWS::ApiGateway::Deployment"
+  ],
+  "conditional_resources": [
+    {
+      "condition": { "path": "properties.Domain.DomainName", "op": "truthy" },
+      "resources": ["AWS::ApiGateway::DomainName"]
+    },
+    {
+      "condition": { "path": "properties.Auth.UsagePlan", "op": "truthy" },
+      "resources": [
+        "AWS::ApiGateway::UsagePlan",
+        "AWS::ApiGateway::UsagePlanKey",
+        "AWS::ApiGateway::ApiKey"
+      ]
+    },
+    {
+      "condition": {
+        "path": "properties.Events.*.Type",
+        "op": "any_eq",
+        "value": "Api"
+      },
+      "resources": ["AWS::ApiGateway::Method"]
+    }
+  ],
+  "logical_id_templates": [
+    "<api-logical-id>.Stage",
+    "<api-logical-id>.Deployment",
+    "ApiGatewayDomainName<sha>",
+    "<api-logical-id>.DomainName",
+    "<api-logical-id>.UsagePlan",
+    "<api-logical-id>.UsagePlanKey",
+    "<api-logical-id>.ApiKey"
+  ]
+}

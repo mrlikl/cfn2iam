@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "resource_type": "AWS::Serverless::SimpleTable",
+  "base_resources": [
+    "AWS::DynamoDB::Table"
+  ],
+  "conditional_resources": [],
+  "logical_id_templates": [
+    "<simpletable-logical-id>"
+  ]
+}
