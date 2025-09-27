@@ -1,0 +1,7 @@
+{
+  "resource_type": "AWS::Serverless::SimpleTable",
+  "base_resources": [
+    "AWS::DynamoDB::Table"
+  ],
+  "conditional_resources": []
+}

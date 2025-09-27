@@ -37,28 +37,119 @@ def ignore_unknown_tags(loader, tag_suffix, node):
 yaml.SafeLoader.add_multi_constructor('!', ignore_unknown_tags)
 
 
-def map_sam_resources(resource_types):
-    """Map SAM resources to their underlying CloudFormation resources"""
-    sam_mapping = {
-        'AWS::Serverless::Function': ['AWS::Lambda::Function', 'AWS::IAM::Role', 'AWS::Logs::LogGroup'],
-        'AWS::Serverless::Api': ['AWS::ApiGateway::RestApi', 'AWS::ApiGateway::Deployment', 'AWS::ApiGateway::Stage'],
-        'AWS::Serverless::HttpApi': ['AWS::ApiGatewayV2::Api', 'AWS::ApiGatewayV2::Stage'],
-        'AWS::Serverless::SimpleTable': ['AWS::DynamoDB::Table'],
-        'AWS::Serverless::Application': [],  # Skip nested applications
-        'AWS::Serverless::LayerVersion': ['AWS::Lambda::LayerVersion'],
-        'AWS::Serverless::StateMachine': ['AWS::StepFunctions::StateMachine', 'AWS::IAM::Role']
-    }
+import os
+from pathlib import Path
+
+def load_sam_rules():
+    """Load SAM transformation rules from rules directory"""
+    rules = {}
+    rules_dir = Path(__file__).parent.parent / "rules"
     
+    if not rules_dir.exists():
+        return rules
+        
+    for rule_file in rules_dir.glob("AWS_Serverless_*.json"):
+        try:
+            with open(rule_file, 'r') as f:
+                rule = json.load(f)
+                resource_type = rule['resource_type']
+                rules[resource_type] = rule
+        except Exception as e:
+            print(f"Warning: Failed to load rule {rule_file}: {e}")
+    
+    return rules
+
+def evaluate_condition(condition, resource_properties):
+    """Enhanced condition evaluator for SAM rules"""
+    if condition == "always":
+        return True
+    elif condition == "properties.Role == null":
+        return resource_properties.get('Role') is None
+    elif "properties.DeploymentPreference.Role == null" in condition:
+        dp = resource_properties.get('DeploymentPreference', {})
+        return dp.get('Role') is None if dp else False
+    elif "properties.Events.*.Type" in condition:
+        events = resource_properties.get('Events', {})
+        if not events:
+            return False
+        
+        # Extract the condition type/value
+        if "== 'Api'" in condition:
+            return any(event.get('Type') == 'Api' for event in events.values())
+        elif "== 'HttpApi'" in condition:
+            return any(event.get('Type') == 'HttpApi' for event in events.values())
+        elif "== 'IoTRule'" in condition:
+            return any(event.get('Type') == 'IoTRule' for event in events.values())
+        elif "in ['DynamoDB', 'Kinesis', 'MQ', 'MSK', 'SQS']" in condition:
+            streaming_types = ['DynamoDB', 'Kinesis', 'MQ', 'MSK', 'SQS']
+            return any(event.get('Type') in streaming_types for event in events.values())
+        elif "in ['EventBridgeRule', 'Schedule', 'CloudWatchEvents']" in condition:
+            event_types = ['EventBridgeRule', 'Schedule', 'CloudWatchEvents']
+            return any(event.get('Type') in event_types for event in events.values())
+    elif "EventInvokeConfig" in condition:
+        eic = resource_properties.get('EventInvokeConfig', {})
+        dc = eic.get('DestinationConfig', {}) if eic else {}
+        
+        if "OnSuccess.Type == 'SNS'" in condition:
+            on_success = dc.get('OnSuccess', {})
+            return on_success.get('Type') == 'SNS' and on_success.get('Destination') is None
+        elif "OnFailure.Type == 'SNS'" in condition:
+            on_failure = dc.get('OnFailure', {})
+            return on_failure.get('Type') == 'SNS' and on_failure.get('Destination') is None
+        elif "OnSuccess.Type == 'SQS'" in condition:
+            on_success = dc.get('OnSuccess', {})
+            return on_success.get('Type') == 'SQS' and on_success.get('Destination') is None
+        elif "OnFailure.Type == 'SQS'" in condition:
+            on_failure = dc.get('OnFailure', {})
+            return on_failure.get('Type') == 'SQS' and on_failure.get('Destination') is None
+    elif condition.startswith("properties."):
+        # Simple property existence check
+        prop_path = condition.replace("properties.", "").split(".")
+        current = resource_properties
+        for prop in prop_path:
+            if prop in current:
+                current = current[prop]
+            else:
+                return False
+        return current is not None
+    
+    return False
+
+def apply_sam_rules(resource_types, template):
+    """Apply SAM transformation rules to convert SAM resources to CloudFormation"""
+    sam_rules = load_sam_rules()
     mapped_resources = set()
+    
     for resource_type in resource_types:
-        if resource_type in sam_mapping:
-            mapped_resources.update(sam_mapping[resource_type])
-            print(f"Mapped SAM resource {resource_type} to {sam_mapping[resource_type]}")
+        if resource_type in sam_rules:
+            rule = sam_rules[resource_type]
+            
+            # Add base resources
+            mapped_resources.update(rule['base_resources'])
+            print(f"SAM {resource_type} → {rule['base_resources']}")
+            
+            # Find matching resources in template to check conditions
+            matching_resources = []
+            if 'Resources' in template:
+                for res_name, res_def in template['Resources'].items():
+                    if res_def.get('Type') == resource_type:
+                        matching_resources.append(res_def.get('Properties', {}))
+            
+            # Apply conditional resources
+            for condition_rule in rule['conditional_resources']:
+                condition = condition_rule['condition']
+                resources = condition_rule['resources']
+                
+                # Check condition against any matching resource
+                for props in matching_resources:
+                    if evaluate_condition(condition, props):
+                        mapped_resources.update(resources)
+                        print(f"SAM {resource_type} + condition '{condition}' → {resources}")
+                        break
         else:
             mapped_resources.add(resource_type)
     
     return mapped_resources
-
 
 def parse_cloudformation_template(file_path):
     with open(file_path, 'r') as file:
@@ -87,8 +178,8 @@ def parse_cloudformation_template(file_path):
             if not any(re.match(pattern, resource_type) for pattern in ignore_patterns):
                 resource_types.add(resource_type)
     
-    # Map SAM resources to CloudFormation resources
-    return map_sam_resources(resource_types)
+    # Apply SAM transformation rules
+    return apply_sam_rules(resource_types, template)
 
 
 def get_permissions(resourcetype):

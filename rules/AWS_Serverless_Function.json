@@ -1,0 +1,60 @@
+{
+  "resource_type": "AWS::Serverless::Function",
+  "base_resources": [
+    "AWS::Lambda::Function"
+  ],
+  "conditional_resources": [
+    {
+      "condition": "properties.AutoPublishAlias",
+      "resources": ["AWS::Lambda::Alias", "AWS::Lambda::Version"]
+    },
+    {
+      "condition": "properties.Role == null",
+      "resources": ["AWS::IAM::Role"]
+    },
+    {
+      "condition": "properties.DeploymentPreference",
+      "resources": ["AWS::CodeDeploy::Application", "AWS::CodeDeploy::DeploymentGroup"]
+    },
+    {
+      "condition": "properties.DeploymentPreference && properties.DeploymentPreference.Role == null",
+      "resources": ["AWS::IAM::Role"]
+    },
+    {
+      "condition": "properties.Events.*.Type == 'Api' && properties.Events.*.Properties.RestApiId == null",
+      "resources": ["AWS::ApiGateway::RestApi"]
+    },
+    {
+      "condition": "properties.Events.*.Type == 'HttpApi' && properties.Events.*.Properties.ApiId == null",
+      "resources": ["AWS::ApiGatewayV2::Api"]
+    },
+    {
+      "condition": "properties.Events.*.Type in ['DynamoDB', 'Kinesis', 'MQ', 'MSK', 'SQS']",
+      "resources": ["AWS::Lambda::EventSourceMapping"]
+    },
+    {
+      "condition": "properties.Events.*.Type in ['EventBridgeRule', 'Schedule', 'CloudWatchEvents']",
+      "resources": ["AWS::Events::Rule"]
+    },
+    {
+      "condition": "properties.Events.*.Type == 'IoTRule'",
+      "resources": ["AWS::IoT::TopicRule"]
+    },
+    {
+      "condition": "properties.EventInvokeConfig.DestinationConfig.OnSuccess.Type == 'SNS' && properties.EventInvokeConfig.DestinationConfig.OnSuccess.Destination == null",
+      "resources": ["AWS::Lambda::EventInvokeConfig", "AWS::SNS::Topic"]
+    },
+    {
+      "condition": "properties.EventInvokeConfig.DestinationConfig.OnFailure.Type == 'SNS' && properties.EventInvokeConfig.DestinationConfig.OnFailure.Destination == null",
+      "resources": ["AWS::Lambda::EventInvokeConfig", "AWS::SNS::Topic"]
+    },
+    {
+      "condition": "properties.EventInvokeConfig.DestinationConfig.OnSuccess.Type == 'SQS' && properties.EventInvokeConfig.DestinationConfig.OnSuccess.Destination == null",
+      "resources": ["AWS::Lambda::EventInvokeConfig", "AWS::SQS::Queue"]
+    },
+    {
+      "condition": "properties.EventInvokeConfig.DestinationConfig.OnFailure.Type == 'SQS' && properties.EventInvokeConfig.DestinationConfig.OnFailure.Destination == null",
+      "resources": ["AWS::Lambda::EventInvokeConfig", "AWS::SQS::Queue"]
+    }
+  ]
+}
