@@ -1,27 +1,23 @@
 # CloudFormation to IAM (cfn2iam)
+A tool to automatically generate minimal IAM policy to deploy a CloudFormation stack from its template.
 
 Live tool here - https://mrlikl.github.io/cfn2iam/
 
-A tool to automatically generate minimal IAM policy to deploy a CloudFormation stack from its template.
+PyPI - https://pypi.org/project/cfn2iam/
 
 ## Overview
 
-This tool analyzes CloudFormation templates to identify all resource types used, then queries the CloudFormation registry to determine the required IAM permissions for each resource type. It can generate IAM policy documents or create IAM roles with the appropriate permissions.
+This tool analyzes CloudFormation templates to identify all resource types used, then queries the ~~CloudFormation registry~~ GitHub static website ((https://mrlikl.github.io/cfn2iam/backend/schemas/)) to determine the required IAM permissions for each resource type. It can generate IAM policy documents or create IAM roles with the appropriate permissions.
 
 ## Features
 
+- (NEW) Added support for [SAM](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/what-is-sam.html)
 - Parse CloudFormation templates in JSON or YAML format
 - Extract resource types and determine required permissions
 - Generate IAM policy documents with appropriate permissions
 - Create IAM roles with the generated permissions
 - Option to allow or deny delete permissions
 - Support for permissions boundaries
-
-## Prerequisites
-
-- Python 3.9+
-- [uv package manager](https://docs.astral.sh/uv/getting-started/installation/)
-- boto3 (only required for IAM role creation with `-c` flag): `pip install boto3`
 
 ## Installation
 
