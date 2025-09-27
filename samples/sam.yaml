@@ -12,3 +12,12 @@ Resources:
       Role: arn:aws:iam::123456123456:role/service-role/my-sample-role
       Tracing:
         Enabled: true
+  SAMAPP:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: "arn:aws:serverlessrepo:us-east-1:012345678901:applications/my-application"
+        SemanticVersion: 1.0.0
+      Parameters:
+        StringParameter: parameter-value
+        IntegerParameter: 2

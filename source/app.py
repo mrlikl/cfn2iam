@@ -80,6 +80,8 @@ def _get_values_by_path(props: Dict, path_parts: Tuple[str, ...]) -> List:
 
 @lru_cache(maxsize=8192)
 def compile_condition_callable(path: str, op: str, value: Any = None) -> Callable[[Dict], bool]:
+    if path.startswith("properties."):
+        path = path[11:]
     path_parts = tuple(path.split("."))
     if op == "exists":
         return lambda props: len(_get_values_by_path(props, path_parts)) > 0

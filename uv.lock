@@ -50,7 +50,7 @@ iam = [
 
 [package.metadata]
 requires-dist = [
-    { name = "boto3", marker = "extra == 'iam'", specifier = ">=1.40" },
+    { name = "boto3", marker = "extra == 'iam'", specifier = ">=1.26" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "typer", specifier = ">=0.19" },
 ]
