@@ -1,0 +1,37 @@
+{
+  "version": "1.0",
+  "resource_type": "AWS::Serverless::Connector",
+  "base_resources": [],
+  "conditional_resources": [
+    {
+      "condition": { "path": "properties.Permissions", "op": "truthy" },
+      "resources": ["AWS::Lambda::Permission"]
+    },
+    {
+      "condition": {
+        "path": "properties.Destination.Type",
+        "op": "any_eq",
+        "value": "SNS"
+      },
+      "resources": ["AWS::SNS::TopicPolicy"]
+    },
+    {
+      "condition": {
+        "path": "properties.Destination.Type",
+        "op": "any_eq",
+        "value": "SQS"
+      },
+      "resources": ["AWS::SQS::QueuePolicy"]
+    },
+    {
+      "condition": { "path": "properties.Source.Type", "op": "truthy" },
+      "resources": ["AWS::IAM::ManagedPolicy"]
+    }
+  ],
+  "logical_id_templates": [
+    "<connector-logical-id>Policy",
+    "<connector-logical-id>TopicPolicy",
+    "<connector-logical-id>QueuePolicy",
+    "<connector-logical-id><permission>LambdaPermission"
+  ]
+}

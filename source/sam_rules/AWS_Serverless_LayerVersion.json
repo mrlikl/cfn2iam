@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "resource_type": "AWS::Serverless::LayerVersion",
+  "base_resources": [
+    "AWS::Lambda::LayerVersion"
+  ],
+  "conditional_resources": [],
+  "logical_id_templates": [
+    "<layerversion-logical-id>"
+  ]
+}

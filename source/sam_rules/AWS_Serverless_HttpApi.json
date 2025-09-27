@@ -1,0 +1,33 @@
+{
+  "version": "1.0",
+  "resource_type": "AWS::Serverless::HttpApi",
+  "base_resources": [
+    "AWS::ApiGatewayV2::Api"
+  ],
+  "conditional_resources": [
+    {
+      "condition": { "path": "properties.StageName", "op": "truthy" },
+      "resources": [
+        "AWS::ApiGatewayV2::Stage"
+      ]
+    },
+    {
+      "condition": { "path": "properties.StageName", "op": "is_null" },
+      "resources": [
+        "AWS::ApiGatewayV2::Stage"
+      ]
+    },
+    {
+      "condition": { "path": "properties.Domain.DomainName", "op": "truthy" },
+      "resources": [
+        "AWS::ApiGatewayV2::DomainName"
+      ]
+    }
+  ],
+  "logical_id_templates": [
+    "<httpapi-logical-id>.Stage",
+    "<httpapi-logical-id>ApiGatewayDefaultStage",
+    "ApiGatewayDomainNameV2<sha>",
+    "<httpapi-logical-id>.DomainName"
+  ]
+}

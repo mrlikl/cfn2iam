@@ -1,0 +1,80 @@
+{
+  "version": "1.0",
+  "resource_type": "AWS::Serverless::GraphQLApi",
+  "base_resources": [
+    "AWS::AppSync::DataSource",
+    "AWS::AppSync::FunctionConfiguration",
+    "AWS::AppSync::GraphQLApi",
+    "AWS::AppSync::GraphQLSchema",
+    "AWS::AppSync::Resolver"
+  ],
+  "conditional_resources": [
+    {
+      "condition": {
+        "path": "properties.Domain.DomainName",
+        "op": "truthy"
+      },
+      "resources": [
+        "AWS::AppSync::DomainName",
+        "AWS::AppSync::DomainNameApiAssociation"
+      ]
+    },
+    {
+      "condition": {
+        "path": "properties.AuthenticationType",
+        "op": "any_eq",
+        "value": "API_KEY"
+      },
+      "resources": [
+        "AWS::AppSync::ApiKey"
+      ]
+    },
+    {
+      "condition": {
+        "path": "properties.ApiKeys",
+        "op": "truthy"
+      },
+      "resources": [
+        "AWS::AppSync::ApiKey"
+      ]
+    },
+    {
+      "condition": {
+        "path": "properties.ApiCache",
+        "op": "truthy"
+      },
+      "resources": [
+        "AWS::AppSync::ApiCache"
+      ]
+    },
+    {
+      "condition": {
+        "path": "properties.ApiCaching",
+        "op": "truthy"
+      },
+      "resources": [
+        "AWS::AppSync::ApiCache"
+      ]
+    },
+    {
+      "condition": {
+        "path": "properties.Connectors",
+        "op": "truthy"
+      },
+      "resources": [
+        "AWS::Serverless::Connector"
+      ]
+    }
+  ],
+  "logical_id_templates": [
+    "<graphqlapi-logical-id>",
+    "<graphqlapi-logical-id><datasource-relative-id><datasource-type>DataSource",
+    "<graphqlapi-logical-id><function-relative-id>",
+    "<graphqlapi-logical-id>Schema",
+    "<graphqlapi-logical-id><operation-type><resolver-relative-id>",
+    "<graphqlapi-logical-id>ApiCache",
+    "<graphqlapi-logical-id><apikey-relative-id>",
+    "<graphqlapi-logical-id>DomainName",
+    "<graphqlapi-logical-id>DomainNameApiAssociation"
+  ]
+}
