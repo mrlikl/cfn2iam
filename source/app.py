@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-import botocore.session
 import typer
 import json
 import yaml
 import sys
 import re
 import uuid
+import urllib.request
+import urllib.error
 from typing import Optional
 from importlib.metadata import version
 
@@ -66,10 +67,20 @@ def parse_cloudformation_template(file_path):
 
 
 def get_permissions(resourcetype):
-    session = botocore.session.get_session()
-    cfn_client = session.create_client('cloudformation')
-    response = cfn_client.describe_type(Type='RESOURCE', TypeName=resourcetype)
-    data = json.loads(response['Schema'])
+    # Convert resource type to filename format (AWS::S3::Bucket -> AWS_S3_Bucket.json)
+    filename = resourcetype.replace('::', '_') + '.json'
+    url = f'https://mrlikl.github.io/cfn2iam/backend/schemas/{filename}'
+    
+    try:
+        with urllib.request.urlopen(url) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(f"Warning: Schema not found for {resourcetype}")
+            return set(), set()
+        raise Exception(f"Failed to fetch schema for {resourcetype}: {e}")
+    except Exception as e:
+        raise Exception(f"Error processing schema for {resourcetype}: {e}")
 
     iam_update = set()
     iam_delete = set()
@@ -129,8 +140,8 @@ def generate_policy_document(all_update_permissions, all_delete_permissions, all
 
 
 def create_iam_role(policy_document, role_name, permissions_boundary=None):
-    session = botocore.session.get_session()
-    iam_client = session.create_client('iam')
+    import boto3
+    iam_client = boto3.client('iam')
     trust_policy = {
         "Version": "2012-10-17",
         "Statement": [

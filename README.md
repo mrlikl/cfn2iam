@@ -20,7 +20,7 @@ This tool analyzes CloudFormation templates to identify all resource types used,
 ## Prerequisites
 
 - Python 3.9+
-- AWS CLI configured with [CloudFormation DescribeType](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_DescribeType.html) permission
+- AWS CLI configured (only required for IAM role creation with `-c` flag)
 - [uv package manager](https://docs.astral.sh/uv/getting-started/installation/)
 
 ## Installation
@@ -67,7 +67,7 @@ cfn2iam path/to/template.yaml -p arn:aws:iam::123456789012:policy/boundary
 ## How It Works
 
 1. The tool parses the CloudFormation template to extract all resource types
-2. For each resource type, it queries the CloudFormation registry to get the required permissions
+2. For each resource type, it fetches the schema from pre-hosted GitHub schemas (https://mrlikl.github.io/cfn2iam/backend/schemas/)
 3. It categorizes permissions into "update" (create/update/read) and "delete-specific" permissions
 4. It generates a policy document with appropriate Allow and Deny statements
 5. It saves the policy document to a file with a unique name
