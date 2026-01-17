@@ -19,8 +19,8 @@ classifiers = [
 license-files = ["LICENSE"]
 keywords = ["aws", "cloudformation", "iam", "permissions"]
 dependencies = [
-    "PyYAML>=6.0",
-    "typer>=0.19"
+    "PyYAML>=6.0.3",
+    "typer>=0.21.1"
 ]
 requires-python = ">=3.9"
 

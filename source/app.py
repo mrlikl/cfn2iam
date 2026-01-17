@@ -33,23 +33,6 @@ def ignore_unknown_tags(loader, tag_suffix, node):
 
 yaml.SafeLoader.add_multi_constructor('!', ignore_unknown_tags)
 
-SAM_RULES_DIR = Path(__file__).parent / "sam_rules"
-
-def load_sam_rules():
-    rules = {}
-    if not SAM_RULES_DIR.exists():
-        return rules
-    for rule_file in sorted(SAM_RULES_DIR.glob("*.json")):
-        try:
-            with open(rule_file, "r") as f:
-                rule = json.load(f)
-                resource_type = rule.get("resource_type") or rule.get("resourceType")
-                if resource_type:
-                    rules[resource_type] = rule
-        except Exception:
-            continue
-    return rules
-
 def _is_truthy(v: Any) -> bool:
     if v is None:
         return False
@@ -98,52 +81,64 @@ def compile_condition_callable(path: str, op: str, value: Any = None) -> Callabl
         return lambda props: (not (vals := _get_values_by_path(props, path_parts))) or all(v is None for v in vals)
     raise ValueError(f"unsupported op: {op}")
 
-def evaluate_condition(condition: Any, resource_properties: Dict) -> bool:
-    if isinstance(condition, dict):
-        path = condition.get("path")
-        op = condition.get("op")
-        value = condition.get("value")
-        if not path or not op:
-            return False
-        try:
-            fn = compile_condition_callable(path, op, value)
-        except Exception:
-            return False
-        return fn(resource_properties)
-    return False
+@lru_cache(maxsize=1)
+def get_schema_index() -> Dict[str, str]:
+    url = "https://mrlikl.github.io/cfn2iam/backend/schemas/index.json"
+    req = urllib.request.Request(url, headers={"User-Agent": "cfn2iam/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            return {s["typeName"]: s["filename"] for s in data.get("schemas", [])}
+    except Exception as e:
+        print(f"Warning: Failed to fetch schema index: {e}")
+        return {}
 
-_COMPILED_SAM_RULES = {}
-for rtype, rule in load_sam_rules().items():
-    base = tuple(rule.get("base_resources") or [])
-    conds = []
-    for cr in rule.get("conditional_resources", []):
-        cond = cr.get("condition")
-        if isinstance(cond, dict):
-            try:
-                fn = compile_condition_callable(cond["path"], cond["op"], cond.get("value"))
-                conds.append((fn, tuple(cr.get("resources", []))))
-            except Exception:
-                continue
-    _COMPILED_SAM_RULES[rtype] = {"base": base, "conds": conds}
+def get_sam_rule(resourcetype: str):
+    filename = resourcetype.replace("::", "_") + ".json"
+    url = f"https://mrlikl.github.io/cfn2iam/backend/sam_rules/{filename}"
+    req = urllib.request.Request(url, headers={"User-Agent": "cfn2iam/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            rule = json.loads(response.read().decode())
+            base = tuple(rule.get("base_resources") or [])
+            conds = []
+            for cr in rule.get("conditional_resources", []):
+                cond = cr.get("condition")
+                if isinstance(cond, dict):
+                    try:
+                        fn = compile_condition_callable(cond["path"], cond["op"], cond.get("value"))
+                        conds.append((fn, tuple(cr.get("resources", []))))
+                    except Exception:
+                        continue
+            return {"base": base, "conds": conds}
+    except Exception:
+        return None
 
 def apply_sam_rules(resource_types, template):
     mapped_resources = set()
     props_by_type: Dict[str, List[Dict]] = {}
-    for res_def in template.get("Resources", {}).values():
-        rtype = res_def.get("Type")
-        if rtype:
-            props_by_type.setdefault(rtype, []).append(res_def.get("Properties", {}) or {})
+    
+    # Check if any SAM resources exist before fetching rules
+    has_sam = any(rtype.startswith("AWS::Serverless::") for rtype in resource_types)
+    
+    if has_sam:
+        for res_def in template.get("Resources", {}).values():
+            rtype = res_def.get("Type")
+            if rtype:
+                props_by_type.setdefault(rtype, []).append(res_def.get("Properties", {}) or {})
+                
     for rtype in resource_types:
-        if rtype in _COMPILED_SAM_RULES:
-            rule = _COMPILED_SAM_RULES[rtype]
-            mapped_resources.update(rule["base"])
-            for cond_fn, resources in rule["conds"]:
-                for props in props_by_type.get(rtype, []):
-                    if cond_fn(props):
-                        mapped_resources.update(resources)
-                        break
-        else:
-            mapped_resources.add(rtype)
+        if rtype.startswith("AWS::Serverless::"):
+            rule = get_sam_rule(rtype)
+            if rule:
+                mapped_resources.update(rule["base"])
+                for cond_fn, resources in rule["conds"]:
+                    for props in props_by_type.get(rtype, []):
+                        if cond_fn(props):
+                            mapped_resources.update(resources)
+                            break
+                continue
+        mapped_resources.add(rtype)
     return mapped_resources
 
 def parse_cloudformation_template(file_path):
@@ -165,7 +160,12 @@ def parse_cloudformation_template(file_path):
 
 @lru_cache(maxsize=1024)
 def get_permissions_cached(resourcetype: str):
-    filename = resourcetype.replace("::", "_") + ".json"
+    index = get_schema_index()
+    filename = index.get(resourcetype)
+    if not filename:
+        # Fallback to construction if index fails or type missing
+        filename = resourcetype.replace("::", "_").replace("/", "_") + ".json"
+        
     url = f"https://mrlikl.github.io/cfn2iam/backend/schemas/{filename}"
     req = urllib.request.Request(url, headers={"User-Agent": "cfn2iam/1.0"})
     try:
