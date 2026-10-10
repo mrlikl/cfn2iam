@@ -99,6 +99,21 @@ def test_unknown_type_fails_by_default(tmp_path, monkeypatch):
     assert policy_files(tmp_path) == []
 
 
+def test_action_needed_by_one_type_is_never_denied_for_another(tmp_path, monkeypatch):
+    # sns:Unsubscribe is delete-only for a subscription but part of updating a topic.
+    topic = {"handlers": {"update": {"permissions": ["sns:SetTopicAttributes", "sns:Unsubscribe"]}}}
+    subscription = {"handlers": {"create": {"permissions": ["sns:Subscribe"]}, "delete": {"permissions": ["sns:Unsubscribe"]}}}
+    monkeypatch.setattr(cli, "_fetch_json", fake_fetch({"AWS_SNS_Topic.json": topic, "AWS_SNS_Subscription.json": subscription}))
+    template = {"Resources": {"T": {"Type": "AWS::SNS::Topic"}, "S": {"Type": "AWS::SNS::Subscription"}}}
+    result = run([write_template(tmp_path, template)])
+
+    assert result.exit_code == 0, result.output
+    [policy_file] = policy_files(tmp_path)
+    statements = {s["Effect"]: s["Action"] for s in json.loads(policy_file.read_text())["Statement"]}
+    assert "sns:Unsubscribe" in statements["Allow"]
+    assert "Deny" not in statements  # nothing left that only deletion needs
+
+
 def test_unknown_type_can_be_skipped(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_fetch_json", fake_fetch({"AWS_S3_Bucket.json": SCHEMA}))
     result = run([write_template(tmp_path, TEMPLATE), "--ignore-unknown"])

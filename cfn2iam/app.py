@@ -254,7 +254,9 @@ def aggregate_permissions(resource_types: List[str], region: Optional[str] = Non
                 continue
             all_update.update(u)
             all_delete.update(d)
-    return all_update, all_delete, failures
+    # An action can be delete-only for one type but needed to create or update another.
+    # Keep it allowed: an explicit Deny would override the Allow and break the deploy.
+    return all_update, all_delete - all_update, failures
 
 def generate_random_hash():
     return uuid.uuid4().hex[:8]
