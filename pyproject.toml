@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cfn2iam"
 dynamic = ["version"]
-description = "A tool to automatically generate minimal IAM policy to deploy a CloudFormation stack from its template."
+description = "Generate the IAM policy a CloudFormation stack needs, from its template, before you deploy it."
 readme = "README.md"
 authors = [
     {name = "S Murali Krishnan", email = "mrlikrsh@gmail.com"}
@@ -17,7 +17,7 @@ classifiers = [
   "Topic :: Utilities",
 ]
 license-files = ["LICENSE"]
-keywords = ["aws", "cloudformation", "iam", "permissions"]
+keywords = ["aws", "cloudformation", "sam", "iam", "permissions", "least-privilege"]
 dependencies = [
     "PyYAML>=6.0.3",
     "typer>=0.21.1"
@@ -28,13 +28,20 @@ requires-python = ">=3.9"
 iam = ["boto3>=1.26"]
 
 [project.urls]
-Homepage = "https://github.com/mrlikl/cfn2iam.git"
+Homepage = "https://github.com/mrlikl/cfn2iam"
+Issues = "https://github.com/mrlikl/cfn2iam/issues"
+"Web version" = "https://mrlikl.github.io/cfn2iam/"
 
 [project.scripts]
-cfn2iam = "source.app:app"
+cfn2iam = "cfn2iam.app:app"
 
 [tool.hatch.version]
 source = "vcs"
 
 [tool.hatch.build.targets.wheel]
-packages = ["source"]
+packages = ["cfn2iam"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
