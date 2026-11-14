@@ -71,9 +71,18 @@ def get_registry_schema(resourcetype: str, region: Optional[str]) -> Dict:
 
 
 async def analyze_template_file(
-    template_path: str, region: Optional[str] = None, use_registry: bool = False, allow_delete: bool = False
+    template_path: str,
+    region: Optional[str] = None,
+    use_registry: bool = False,
+    allow_delete: bool = False,
+    account: Optional[str] = None,
+    partition: str = "aws",
 ) -> core.Analysis:
-    """Run the core on a template file, fetching schemas and registry lookups on a thread pool."""
+    """Run the core on a template file, fetching schemas and registry lookups on a thread pool.
+
+    With ``account``, the policy is scoped to it, ``partition`` and ``region`` (which then
+    does both jobs: registry lookups and scoping). Without it, ``region`` is only for the registry.
+    """
     # Read before any fetch starts, so blocking the event loop here costs nothing.
     with open(template_path) as f:  # noqa: ASYNC230
         text = f.read()
@@ -107,7 +116,24 @@ async def analyze_template_file(
             allow_delete=allow_delete,
             schema_fallback=registry if use_registry else registry_fallback,
             published_schemas=not use_registry,
+            account=account,
+            region=region if account else None,
+            partition=partition,
         )
+
+
+def scoping_summary(scoping: Dict) -> str:
+    """One line on what scoping did, from Analysis.scoping."""
+    total = scoping["scoped_count"] + scoping["unscoped_count"]
+    where = f"account {scoping['account']}, " + (f"region {scoping['region']}" if scoping["region"] else "any region")
+    line = f"Scoped {scoping['scoped_count']} of {total} actions to {where} (partition {scoping['partition']})"
+    if scoping["unscoped"]:
+        reasons = "; ".join(
+            f"{len(actions)} {core.UNSCOPED_REASONS.get(reason, reason)}"
+            for reason, actions in scoping["unscoped"].items()
+        )
+        line += f'. On "Resource": "*": {reasons}'
+    return line + "."
 
 
 def generate_random_hash():
@@ -176,7 +202,17 @@ def main(
         help="Look up every resource type with CloudFormation DescribeType in your account instead of the published schemas (needs cfn2iam\\[iam] and AWS credentials)",
     ),
     region: str = typer.Option(
-        None, "--region", help="AWS region for CloudFormation registry lookups (default: your AWS config)"
+        None,
+        "--region",
+        help="AWS region for CloudFormation registry lookups (default: your AWS config), and with --account the region to scope resources to (default: any region)",
+    ),
+    account: str = typer.Option(
+        None,
+        "--account",
+        help='Scope resources to this 12-digit AWS account ID: ARNs in the account (and --region) instead of "*" where IAM supports it',
+    ),
+    partition: str = typer.Option(
+        "aws", "--partition", help="AWS partition for --account scoping: aws, aws-cn, aws-us-gov, ..."
     ),
     version: Optional[bool] = typer.Option(None, "--version", callback=version_callback, help="Show version and exit"),
 ):
@@ -184,7 +220,21 @@ def main(
         if registry and not _has_boto3():
             print('Error: --registry needs boto3. Install with: pip install "cfn2iam[iam]"', file=sys.stderr)
             sys.exit(1)
-        analysis = asyncio.run(analyze_template_file(template_path, region, registry, allow_delete))
+        account = (account or "").strip() or None
+        try:
+            # --region alone is for registry lookups, so only --partition needs --account here.
+            core.make_scope(account, region if account else None, partition)
+        except core.ScopeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            analysis = asyncio.run(
+                analyze_template_file(template_path, region, registry, allow_delete, account, partition)
+            )
+        except core.ServiceReferenceError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            print("No policy was written, because it couldn't be scoped as asked.", file=sys.stderr)
+            sys.exit(1)
         for warning in analysis.warnings:
             print(f"Warning: {warning}", file=sys.stderr)
         resource_types = analysis.resource_types
@@ -207,6 +257,8 @@ def main(
                 print("Use --ignore-unknown to skip resource types that can't be found.", file=sys.stderr)
             print("No policy was written, because it would be missing permissions.", file=sys.stderr)
             sys.exit(1)
+        if analysis.scoping is not None:
+            print(scoping_summary(analysis.scoping), file=sys.stderr)
         policy_document = analysis.policy
         file_path = f"policy-{generate_random_hash()}.json"
         with open(file_path, "w") as f:
