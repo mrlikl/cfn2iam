@@ -1,0 +1,182 @@
+name: cfn2iam IAM permission check
+description: >-
+  Check the IAM permissions CloudFormation and SAM templates need against a committed baseline policy,
+  comment the change on the pull request, and fail on permission drift.
+author: S Murali Krishnan
+branding:
+  icon: shield
+  color: orange
+
+# Runs cfn2iam from this action's own files (not from PyPI), so the ref a workflow pins is
+# exactly the code that runs, with the dependency versions in uv.lock. Docs:
+# https://github.com/mrlikl/cfn2iam#use-it-in-ci
+
+inputs:
+  templates:
+    description: >-
+      Template files to check, one per line: paths or glob patterns (** matches any number of directories),
+      relative to the workspace. Their permissions are combined, as for one deploy role that deploys every
+      template; run the action once per role to check roles separately (give each run its own name).
+    required: true
+  baseline:
+    description: >-
+      The baseline policy file: the policy the deploy role has, or the cfn2iam output it was built from. Several
+      files (one per line) combine, as for a role with several policies. Empty: list the permissions the templates
+      need without comparing.
+    required: false
+    default: ""
+  fail-on-drift:
+    description: Fail when the templates need actions the baseline does not grant.
+    required: false
+    default: "true"
+  comment:
+    description: >-
+      Comment on the pull request: always, on-change (only when the permissions differ from the baseline; an
+      earlier comment is still updated), or never. The comment is updated in place on later pushes.
+    required: false
+    default: always
+  conditional:
+    description: >-
+      How to count actions the baseline grants only under a Condition or for specific resources, which cfn2iam
+      can't evaluate from a template: missing (count them as not granted) or granted.
+    required: false
+    default: missing
+  allow-delete:
+    description: Allow the delete-only actions instead of denying them (cfn2iam -d).
+    required: false
+    default: "false"
+  ignore-unknown:
+    description: Skip resource types with no schema instead of failing (cfn2iam --ignore-unknown).
+    required: false
+    default: "false"
+  require-baseline:
+    description: Fail when a baseline is given but does not exist yet. By default the first run explains how to create it.
+    required: false
+    default: "false"
+  update-baseline:
+    description: >-
+      Write the generated policy to the baseline file instead of failing on drift, for a workflow that accepts a
+      change (commit the file afterwards). Needs exactly one baseline file.
+    required: false
+    default: "false"
+  name:
+    description: A name for this check, when a workflow runs the action more than once. Each name gets its own comment.
+    required: false
+    default: ""
+  region:
+    description: Passed to cfn2iam --region.
+    required: false
+    default: ""
+  account:
+    description: Passed to cfn2iam --account (resource scoping).
+    required: false
+    default: ""
+  partition:
+    description: Passed to cfn2iam --partition (resource scoping).
+    required: false
+    default: ""
+  registry-fallback:
+    description: >-
+      Install cfn2iam[iam] so that resource types with no public schema (private or third-party types) are looked
+      up with CloudFormation DescribeType. Needs AWS credentials in the job.
+    required: false
+    default: "false"
+  python-version:
+    description: Python for cfn2iam (3.11 or later). Empty lets uv choose an installed one, or download one.
+    required: false
+    default: ""
+  github-token:
+    description: Token for the pull request comment. Needs pull-requests write permission to comment.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  drift:
+    description: true when the templates need actions the baseline does not grant.
+    value: ${{ steps.check.outputs.drift }}
+  added-count:
+    description: Number of actions the templates need that the baseline does not grant (0 without a baseline).
+    value: ${{ steps.check.outputs.added-count }}
+  removed-count:
+    description: Number of baseline Allow entries no action the templates need matches.
+    value: ${{ steps.check.outputs.removed-count }}
+  conditional-count:
+    description: Number of needed actions the baseline grants only under a Condition or for specific resources.
+    value: ${{ steps.check.outputs.conditional-count }}
+  baseline-status:
+    description: found, missing (the baseline file does not exist yet) or none (no baseline input).
+    value: ${{ steps.check.outputs.baseline-status }}
+  policy-path:
+    description: Path of the generated policy, all templates combined.
+    value: ${{ steps.check.outputs.policy-path }}
+  report-path:
+    description: Path of the report, in Markdown (the job summary's text).
+    value: ${{ steps.check.outputs.report-path }}
+  commented:
+    description: true when the pull request comment was created or updated.
+    value: ${{ steps.check.outputs.commented }}
+  comment-url:
+    description: URL of the pull request comment.
+    value: ${{ steps.check.outputs.comment-url }}
+  error:
+    description: true when the check could not run (a template missing or unresolvable, an invalid baseline).
+    value: ${{ steps.check.outputs.error }}
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        # Read uv settings from the action, not the caller's repository, and leave the caller's cache alone.
+        working-directory: ${{ github.action_path }}
+        enable-cache: "false"
+        add-problem-matchers: "false"
+        quiet: "true"
+
+    - name: Install cfn2iam from the action
+      id: install
+      shell: bash
+      env:
+        ACTION_REF: ${{ github.action_ref }}
+        PYTHON_VERSION: ${{ inputs.python-version }}
+        REGISTRY_FALLBACK: ${{ inputs.registry-fallback }}
+      run: |
+        set -euo pipefail
+        venv="$RUNNER_TEMP/cfn2iam-action-venv"
+        if [ ! -e "$GITHUB_ACTION_PATH/.git" ]; then
+          # A downloaded action has no git history for hatch-vcs to read the version from.
+          if [[ "$ACTION_REF" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            export SETUPTOOLS_SCM_PRETEND_VERSION="${BASH_REMATCH[1]}"
+          else
+            local_label=$(printf '%s' "${ACTION_REF:-unknown}" | tr -c 'A-Za-z0-9' '.' | cut -c1-40 | sed 's/^\.*//; s/\.*$//')
+            export SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+${local_label:-unknown}"
+          fi
+        fi
+        args=(sync --project "$GITHUB_ACTION_PATH" --locked --no-dev --no-editable --reinstall-package cfn2iam --quiet)
+        if [ "$REGISTRY_FALLBACK" = true ]; then args+=(--extra iam); fi
+        if [ -n "$PYTHON_VERSION" ]; then args+=(--python "$PYTHON_VERSION"); fi
+        UV_PROJECT_ENVIRONMENT="$venv" uv "${args[@]}"
+        if [ -x "$venv/bin/python" ]; then py="$venv/bin/python"; else py="$venv/Scripts/python.exe"; fi
+        "$py" -I -m cfn2iam --version
+        echo "python=$py" >> "$GITHUB_OUTPUT"
+
+    - name: Check the IAM permissions
+      id: check
+      shell: bash
+      env:
+        CFN2IAM_PYTHON: ${{ steps.install.outputs.python }}
+        INPUT_TEMPLATES: ${{ inputs.templates }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_FAIL_ON_DRIFT: ${{ inputs.fail-on-drift }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_CONDITIONAL: ${{ inputs.conditional }}
+        INPUT_ALLOW_DELETE: ${{ inputs.allow-delete }}
+        INPUT_IGNORE_UNKNOWN: ${{ inputs.ignore-unknown }}
+        INPUT_REQUIRE_BASELINE: ${{ inputs.require-baseline }}
+        INPUT_UPDATE_BASELINE: ${{ inputs.update-baseline }}
+        INPUT_NAME: ${{ inputs.name }}
+        INPUT_REGION: ${{ inputs.region }}
+        INPUT_ACCOUNT: ${{ inputs.account }}
+        INPUT_PARTITION: ${{ inputs.partition }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: '"$CFN2IAM_PYTHON" -I "$GITHUB_ACTION_PATH/action/cfn2iam_action.py"'

@@ -398,7 +398,8 @@ def make_scope(account: Optional[str] = None, region: Optional[str] = None, part
     if account is None:
         given = [name for name, value in (("region", region), ("partition", partition)) if value not in (None, "aws")]
         if given:
-            raise ScopeError(f"{' and '.join(given)} only apply to resource scoping, which needs an account")
+            verb = "applies" if len(given) == 1 else "apply"
+            raise ScopeError(f"{' and '.join(given)} only {verb} to resource scoping, which needs an account")
         return None
     if not re.fullmatch(r"\d{12}", account):
         raise ScopeError(f"the account must be a 12-digit AWS account ID, not {account!r}")
