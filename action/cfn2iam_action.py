@@ -186,6 +186,7 @@ class Generation:
     output: Optional[str] = None  # the --format json file, when cfn2iam succeeded
     error: Optional[str] = None
     log: str = ""  # cfn2iam's stderr (warnings) when it succeeded
+    hint: str = ""  # what to change in the action's inputs, for an error
 
 
 def generate(template: str, out_path: str, options: List[str], cwd: str) -> Generation:
@@ -197,12 +198,13 @@ def generate(template: str, out_path: str, options: List[str], cwd: str) -> Gene
     log = "\n".join(line for line in proc.stderr.splitlines() if not line.startswith("Generated IAM Policy Document"))
     if proc.returncode != 0:
         message = "\n".join(part for part in (proc.stderr.strip(), proc.stdout.strip()) if part)
+        hint = ""
         if 'install "cfn2iam[iam]"' in message:
-            message += (
-                "\n\nIn the action, set `registry-fallback: true` (and configure AWS credentials) to look such types "
+            hint = (
+                "In the action, set `registry-fallback: true` (and configure AWS credentials) to look such types "
                 "up in the CloudFormation registry, or `ignore-unknown: true` to skip them."
             )
-        return Generation(template, error=message or f"cfn2iam exited with status {proc.returncode}")
+        return Generation(template, error=message or f"cfn2iam exited with status {proc.returncode}", hint=hint)
     return Generation(template, output=out_path, log=log.strip())
 
 
@@ -339,7 +341,10 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
         g = generate(template, os.path.join(workdir, f"generated-{i}.json"), options, cwd)
         generations.append(g)
         if g.error:
-            errors.append(f"cfn2iam could not generate the policy for `{template}`:\n\n```\n{g.error}\n```")
+            hint = f"\n\n  {g.hint}" if g.hint else ""
+            errors.append(
+                f"cfn2iam could not generate the policy for `{template}`:\n\n  ```\n  {g.error.replace(chr(10), chr(10) + '  ')}\n  ```{hint}"
+            )
             first = next((line for line in g.error.splitlines() if line.strip()), g.error)
             notices.append(("error", f"{template}: {first}"))
         for line in g.log.splitlines():

@@ -401,7 +401,7 @@ def test_compare_uses_only_the_standard_library():
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in (node.names if isinstance(node, ast.Import) else [ast.alias(node.module or "")])
     }
-    assert imported <= {"re", "dataclasses", "functools", "typing"}
+    assert imported <= {"html", "re", "dataclasses", "functools", "typing"}
 
 
 def test_scoped_policy_with_several_statements():

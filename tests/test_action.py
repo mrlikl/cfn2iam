@@ -349,3 +349,15 @@ def test_hand_written_baseline_is_edited_not_regenerated(repo):
     result = run(repo, baseline="role.json", fail_on_drift="false")
     assert "looks hand-written (wildcard actions, statement IDs), so edit it" in result.markdown_comment
     assert "-o role.json" not in result.markdown_comment
+
+
+def test_registry_hint_is_outside_the_error_block(repo, monkeypatch):
+    def needs_registry(template, out_path, options, cwd):
+        return action.Generation(
+            template, error='  X::Y: no public schema; install "cfn2iam[iam]" to ...', hint="Set it."
+        )
+
+    monkeypatch.setattr(action, "generate", needs_registry)
+    text = run(repo).markdown_summary
+    assert "  ```\n    X::Y: no public schema" in text
+    assert "  ```\n\n  Set it." in text

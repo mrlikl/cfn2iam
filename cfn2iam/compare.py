@@ -31,6 +31,7 @@ that caused them, and by default count as not granted (``conditional="missing"``
 so the check fails closed; ``conditional="granted"`` counts them as granted.
 """
 
+import html
 import re
 from dataclasses import dataclass, field
 from functools import cache, lru_cache
@@ -714,7 +715,7 @@ def _render_markdown(report, title, marker, context, notes, footer, limit, detai
                 ]
             )
             for reasons, group in _by_reasons(report.conditional):
-                summary = _md_escape("; ".join(reasons)) or "conditional"
+                summary = html.escape("; ".join(reasons)) or "conditional"  # HTML: no Markdown in <summary>
                 out.extend(["", f"<details><summary>{_plural(len(group), 'action')}: {summary}</summary>", ""])
                 out.extend(_md_compact(group, limit))
                 out.extend(["", "</details>"])
