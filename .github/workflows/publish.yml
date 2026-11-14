@@ -162,4 +162,8 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           ignore-empty-workdir: true # no checkout: this job only uploads
+      # PEP 740 attestations: signs each file with this job's OIDC identity, and uv publish
+      # uploads the attestation with it, so PyPI shows which workflow built the release.
+      - name: Generate attestations
+        uses: astral-sh/attest-action@39b6ce43875c196a579e31635b11aa2a2036384a # v0.0.7
       - run: uv publish --trusted-publishing always dist/*

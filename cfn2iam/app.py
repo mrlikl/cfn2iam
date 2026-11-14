@@ -173,7 +173,7 @@ def main(
     registry: bool = typer.Option(
         False,
         "--registry",
-        help="Look up every resource type with CloudFormation DescribeType in your account instead of the published schemas (needs cfn2iam[iam] and AWS credentials)",
+        help="Look up every resource type with CloudFormation DescribeType in your account instead of the published schemas (needs cfn2iam\\[iam] and AWS credentials)",
     ),
     region: str = typer.Option(
         None, "--region", help="AWS region for CloudFormation registry lookups (default: your AWS config)"
