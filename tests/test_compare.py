@@ -370,7 +370,7 @@ def test_markdown_groups_by_service_and_collapses():
     needed = [f"svc{i % 7}:Action{i}" for i in range(80)]
     text = compare.render_markdown(check(policy(allow(needed)), policy(allow("svc0:*"))))
     assert "Permission drift: the templates need 68 actions" in text
-    assert "<details><summary><code>svc1</code>: 12</summary>" in text  # long: collapsed
+    assert "<details><summary><code>svc1</code> (12)</summary>" in text  # long: collapsed
     assert "- `svc1:Action1`" in text
 
 

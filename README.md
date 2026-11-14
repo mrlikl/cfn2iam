@@ -127,7 +127,49 @@ Pin a release tag (`mrlikl/cfn2iam@v0.4.0`) or a commit SHA for a fixed version,
 
 Every run writes the report to the job summary. On a pull request it also comments, like this:
 
-COMMENT_EXAMPLE
+> #### cfn2iam permission check
+>
+> **Permission drift: the templates need 102 actions the baseline does not grant.**
+>
+> Templates: `samples/cfn.json` · Baseline: `tests/fixtures/action/drift-baseline.json`
+>
+> | | Actions | Counts as drift |
+> |---|--:|:-:|
+> | Needed, not granted by the baseline | 52 | yes |
+> | Granted only under a condition or for some resources | 50 | yes |
+> | Allowed by the baseline, no longer needed | 1 | no |
+> | Delete-only, newly denied | 5 | no |
+> | Denied by the baseline, no longer denied | 1 | no |
+>
+> **Needed, not granted by the baseline (52)**
+>
+> <details><summary><code>kms</code> (7)</summary>
+>
+> - `kms:CreateGrant` (AWS::DynamoDB::Table, AWS::Lambda::Function)
+> - `kms:Decrypt` (AWS::DynamoDB::Table, AWS::Lambda::Function)
+> - ...
+>
+> </details>
+> <details><summary><code>lambda</code> (23)</summary>
+>
+> - `lambda:CreateFunction` (AWS::Lambda::Function)
+> - ...
+>
+> </details>
+>
+> **Granted only under a condition or for some resources (50)**
+>
+> <details><summary>31 actions: allowed by tests/fixtures/action/drift-baseline.json, statement 2 (Sid "TablesInOneRegion"), which has a Condition</summary>
+>
+> | Service | Actions |
+> |---|---|
+> | `dynamodb` | `CreateTable`, `DescribeTable`, `UpdateTable`, ... |
+>
+> </details>
+>
+> **Allowed by the baseline, no longer needed (1)** · **Delete-only actions** · How to accept this change · The generated policy (each collapsed)
+
+That is the self-test in this repository's CI (trimmed), with a hand-written baseline. Each section is grouped by service and collapsed when long, and the comment is cut to fit GitHub's size limit if it has to be. When nothing changed it says **No permission changes: the baseline grants exactly what the templates need.**
 
 **Accepting a change.** When a pull request needs new permissions on purpose, grant them to the deploy role and regenerate the baseline in the same pull request, so the change is reviewed with the template. The comment prints the exact commands; for one template:
 
@@ -143,7 +185,7 @@ cfn2iam templates/b.yaml -o /tmp/b.json
 cfn2iam diff /tmp/a.json /tmp/b.json -w iam/deploy-policy.json
 ```
 
-If the baseline is a hand-written policy (with wildcards or conditions), edit it instead: regenerating replaces it. To regenerate it in CI instead, run the action with `update-baseline: true` and commit the file in a later step, for example from a `workflow_dispatch` workflow on the pull request's branch with `contents: write`. A push made with the workflow's `GITHUB_TOKEN` doesn't start new workflow runs, so the checks won't rerun on that commit until something else is pushed; check out with a GitHub App or personal access token if they must.
+If the baseline is a hand-written policy (with wildcards or conditions), edit it instead: regenerating replaces it (the comment says so when the baseline looks hand-written). To regenerate it in CI instead, run the action with `update-baseline: true` and commit the file in a later step, for example from a `workflow_dispatch` workflow on the pull request's branch with `contents: write`. A push made with the workflow's `GITHUB_TOKEN` doesn't start new workflow runs, so the checks won't rerun on that commit until something else is pushed; check out with a GitHub App or personal access token if they must.
 
 **Forks and Dependabot.** Pull requests from forks, and Dependabot's, get a read-only token on `pull_request`, so the action can't comment there. It says so in a notice and the job summary, and the check itself still passes or fails as usual. Don't switch to `pull_request_target` to get a write token unless no step runs code from the pull request.
 

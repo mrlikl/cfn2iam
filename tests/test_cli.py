@@ -1,6 +1,8 @@
 """The CLI's output options (--format, -o) and the cfn2iam diff command."""
 
 import json
+import os
+import re
 import subprocess
 import sys
 
@@ -211,5 +213,9 @@ def test_entry_point_dispatch(tmp_path, monkeypatch):
 def test_python_dash_m(tmp_path):
     out = subprocess.run([sys.executable, "-m", "cfn2iam", "--version"], capture_output=True, text=True, check=True)
     assert out.stdout.startswith("cfn2iam ")
-    out = subprocess.run([sys.executable, "-m", "cfn2iam", "diff", "--help"], capture_output=True, text=True)
-    assert out.returncode == 0 and "--baseline" in out.stdout
+    # In CI, rich colours the help (GITHUB_ACTIONS forces it), so drop the escape codes.
+    env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"}
+    env.pop("FORCE_COLOR", None)
+    out = subprocess.run([sys.executable, "-m", "cfn2iam", "diff", "--help"], capture_output=True, text=True, env=env)
+    assert out.returncode == 0
+    assert "--baseline" in re.sub(r"\x1b\[[0-9;]*m", "", out.stdout)

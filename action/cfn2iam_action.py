@@ -367,6 +367,7 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
     report = None
     policy_path = ""
     generated_data: List[Dict] = []
+    hand_written = ""
     if not any(g.error for g in generations) and templates:
         try:
             generated_data = [_read_json(g.output) for g in generations]
@@ -375,6 +376,8 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
             if baseline_status == "found":
                 base = compare.load_baseline([(b, _read_json(os.path.join(cwd, b))) for b in inputs.baseline])
             report = compare.compare(gen, base, inputs.conditional)
+            if baseline_status == "found":
+                hand_written = _hand_written([_read_json(os.path.join(cwd, b)) for b in inputs.baseline])
             policy_path = os.path.join(workdir, "policy.json")
             with open(policy_path, "w", encoding="utf-8") as f:
                 json.dump(compare.combined_policy(gen), f, indent=2)
@@ -421,12 +424,18 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
                 "and give your deploy role that policy (or one that grants at least as much). "
                 f"Later runs will report what changes.\n\n```bash\n{commands}\n```"
             )
+        elif report.changed and hand_written:
+            notes.append(
+                "<details><summary>How to accept this change</summary>\n\n"
+                f"{_code_list(inputs.baseline)} looks hand-written ({hand_written}), so edit it: grant the actions "
+                "listed above to the deploy role and to the baseline in this pull request. Regenerating it with "
+                "cfn2iam would replace it with the generated policy below.\n\n</details>"
+            )
         elif report.changed:
             notes.append(
                 "<details><summary>How to accept this change</summary>\n\n"
                 "Grant the new actions to the deploy role, then regenerate the baseline and commit it in this "
-                f"pull request:\n\n```bash\n{commands}\n```\n\n"
-                "If the baseline is a hand-written policy, edit it instead.\n\n</details>"
+                f"pull request:\n\n```bash\n{commands}\n```\n\n</details>"
             )
     if errors:
         notes.insert(0, "> [!CAUTION]\n> **The check could not run.**\n\n" + "\n\n".join(f"- {e}" for e in errors))
@@ -479,6 +488,27 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
         notices.append(("notice", f"Baseline {', '.join(inputs.baseline)} does not exist yet; see the job summary."))
     changed = bool(errors) or report is None or report.changed or baseline_status != "found"
     return Result(comment_md, summary_md, outputs, exit_code, notices, changed)
+
+
+def _hand_written(documents: List) -> str:
+    """Why a baseline isn't plain cfn2iam output, or "" when it could be."""
+    reasons = []
+    for data in documents:
+        try:
+            statements = compare._statements(compare._policy_document(data, ""), "")
+        except compare.PolicyError:
+            continue
+        for st in statements:
+            if "Condition" in st:
+                reasons.append("conditions")
+            if "NotAction" in st or "NotResource" in st:
+                reasons.append("NotAction or NotResource")
+            actions = st.get("Action", [])
+            if any(c in a for a in ([actions] if isinstance(actions, str) else actions) for c in "*?"):
+                reasons.append("wildcard actions")
+            if "Sid" in st:
+                reasons.append("statement IDs")
+    return ", ".join(dict.fromkeys(reasons))
 
 
 def _scope_text(scoping: Dict) -> str:

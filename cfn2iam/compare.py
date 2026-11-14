@@ -605,7 +605,7 @@ def _md_findings(
         if limit is not None and shown >= limit:
             hidden += len(group)
             continue
-        out.append(f"<details{' open' if open_ else ''}><summary><code>{service}</code>: {len(group)}</summary>")
+        out.append(f"<details{' open' if open_ else ''}><summary><code>{service}</code> ({len(group)})</summary>")
         out.append("")
         for f in group:
             if limit is not None and shown >= limit:
@@ -765,7 +765,8 @@ def _render_markdown(report, title, marker, context, notes, footer, limit, detai
             for t, r in skipped.items()
         )
     if notes:
-        out.extend(["", *notes])
+        for note in notes:
+            out.extend(["", note])
     if footer:
         out.extend(["", *footer])
     return "\n".join(out).rstrip() + "\n"

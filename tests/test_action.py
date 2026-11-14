@@ -156,7 +156,11 @@ def test_no_baseline_input(repo):
 
 
 def test_several_templates_and_globs(repo):
-    result = run(repo, templates="stacks/a.yaml\nstacks/[ab].yaml\n# a comment\n", baseline=baseline(repo, ["s3:*"]))
+    result = run(
+        repo,
+        templates="stacks/a.yaml\nstacks/[ab].yaml\n# a comment\n",
+        baseline=baseline(repo, ["s3:CreateBucket", "s3:GetBucketTagging"]),
+    )
     assert "Templates: `stacks/a.yaml`, `stacks/b.yaml`" in result.markdown_comment
     assert result.outputs["added-count"] == "1"  # sqs:CreateQueue
     assert "AWS::S3::Bucket in stacks/b.yaml" in result.markdown_comment
@@ -333,3 +337,12 @@ def test_scoped_run(repo, capsys):
     assert "cfn2iam stacks/a.yaml --region eu-west-1 --account 123456789012 -o iam/other.json" in (
         run(repo, account="123456789012", region="eu-west-1", baseline="iam/other.json").markdown_comment
     )
+
+
+def test_hand_written_baseline_is_edited_not_regenerated(repo):
+    (repo / "role.json").write_text(
+        json.dumps({"Statement": [{"Sid": "S3", "Effect": "Allow", "Action": "s3:Create*", "Resource": "*"}]})
+    )
+    result = run(repo, baseline="role.json", fail_on_drift="false")
+    assert "looks hand-written (wildcard actions, statement IDs), so edit it" in result.markdown_comment
+    assert "-o role.json" not in result.markdown_comment
