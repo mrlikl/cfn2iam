@@ -32,11 +32,7 @@ def isolate(tmp_path, monkeypatch):
     # Never reach a real AWS account from tests.
     monkeypatch.setattr(cli, "_has_boto3", lambda: True)
     monkeypatch.setattr(cli, "get_registry_schema", registry_without)
-    cli.get_schema_index.cache_clear()
-    cli.get_permissions_cached.cache_clear()
     yield
-    cli.get_schema_index.cache_clear()
-    cli.get_permissions_cached.cache_clear()
 
 
 def write_template(tmp_path, template):
@@ -47,6 +43,7 @@ def write_template(tmp_path, template):
 
 def fake_fetch(responses):
     """responses maps a URL suffix to a dict (returned) or an exception (raised)."""
+
     def fetch(url):
         for suffix, value in responses.items():
             if url.endswith(suffix):
@@ -54,6 +51,7 @@ def fake_fetch(responses):
                     raise value
                 return value
         raise cli.NotFound(url)
+
     return fetch
 
 
@@ -102,8 +100,12 @@ def test_unknown_type_fails_by_default(tmp_path, monkeypatch):
 def test_action_needed_by_one_type_is_never_denied_for_another(tmp_path, monkeypatch):
     # sns:Unsubscribe is delete-only for a subscription but part of updating a topic.
     topic = {"handlers": {"update": {"permissions": ["sns:SetTopicAttributes", "sns:Unsubscribe"]}}}
-    subscription = {"handlers": {"create": {"permissions": ["sns:Subscribe"]}, "delete": {"permissions": ["sns:Unsubscribe"]}}}
-    monkeypatch.setattr(cli, "_fetch_json", fake_fetch({"AWS_SNS_Topic.json": topic, "AWS_SNS_Subscription.json": subscription}))
+    subscription = {
+        "handlers": {"create": {"permissions": ["sns:Subscribe"]}, "delete": {"permissions": ["sns:Unsubscribe"]}}
+    }
+    monkeypatch.setattr(
+        cli, "_fetch_json", fake_fetch({"AWS_SNS_Topic.json": topic, "AWS_SNS_Subscription.json": subscription})
+    )
     template = {"Resources": {"T": {"Type": "AWS::SNS::Topic"}, "S": {"Type": "AWS::SNS::Subscription"}}}
     result = run([write_template(tmp_path, template)])
 
@@ -123,13 +125,19 @@ def test_unknown_type_can_be_skipped(tmp_path, monkeypatch):
     [policy_file] = policy_files(tmp_path)
     policy = json.loads(policy_file.read_text())
     assert policy["Statement"] == [
-        {"Effect": "Allow", "Action": ["s3:CreateBucket", "s3:GetBucketTagging", "s3:PutBucketTagging"], "Resource": "*"},
+        {
+            "Effect": "Allow",
+            "Action": ["s3:CreateBucket", "s3:GetBucketTagging", "s3:PutBucketTagging"],
+            "Resource": "*",
+        },
         {"Effect": "Deny", "Action": ["s3:DeleteBucket"], "Resource": "*"},
     ]
 
 
 def test_private_type_resolves_from_registry(tmp_path, monkeypatch):
-    private = {"handlers": {"create": {"permissions": ["myorg:CreateThing"]}, "delete": {"permissions": ["myorg:DeleteThing"]}}}
+    private = {
+        "handlers": {"create": {"permissions": ["myorg:CreateThing"]}, "delete": {"permissions": ["myorg:DeleteThing"]}}
+    }
     looked_up = []
 
     def registry(resourcetype, region):
