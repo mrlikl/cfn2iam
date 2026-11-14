@@ -43,6 +43,97 @@ jobs:
     needs: release-tag
     uses: ./.github/workflows/test.yml
 
+  # Runs after the publish job below, and only if it succeeded: when the upload to PyPI (or any
+  # job before it) fails or is skipped, so is this job, and no Release is created.
+  github-release:
+    name: Create the GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the Release and attach the distributions
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    defaults:
+      run:
+        shell: bash # -eo pipefail, so a failed gh call in a pipeline fails the step
+    steps:
+      - name: The tag is a full version
+        # Never a Release for a moving tag such as v1, even if the trigger's filter is loosened.
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not a vX.Y.Z release tag"; exit 1; }
+      # The same dist/ the publish job uploaded, which the test workflow built and installed.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: The files are the ones on PyPI
+        # Also confirms the upload is live. PyPI's JSON API can lag an upload, so retry for a while.
+        run: |
+          version="${TAG#v}"
+          for _ in $(seq 30); do
+            curl -fsSL "https://pypi.org/pypi/cfn2iam/$version/json" -o pypi.json && break
+            rm -f pypi.json
+            sleep 10
+          done
+          [ -f pypi.json ] || { echo "::error::cfn2iam $version is not on PyPI"; exit 1; }
+          python3 -I - <<'EOF'
+          import hashlib, json, pathlib, sys
+          pypi = {u["filename"]: u["digests"]["sha256"] for u in json.load(open("pypi.json"))["urls"]}
+          local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").iterdir()}
+          for name, digest in sorted(local.items()):
+              print(name, digest, "matches PyPI" if pypi.get(name) == digest else "DIFFERS FROM PyPI")
+          if local != pypi:
+              print(f"::error::dist/ {sorted(local)} does not match the files PyPI serves {sorted(pypi)}")
+              sys.exit(1)
+          EOF
+      - name: Write the release notes
+        # GitHub's generated notes: the pull requests merged since the previous version tag,
+        # grouped as .github/release.yml says, after install instructions for this version.
+        run: |
+          version="${TAG#v}"
+          # The previous release is the highest vX.Y.Z tag below this one. Every release tag is
+          # on main (see release-tag), so version order is history order.
+          previous=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; echo "$TAG"; } | sort -uV \
+            | awk -v tag="$TAG" '$0 == tag { print prev; exit } { prev = $0 }')
+          echo "Changes since: ${previous:-the first commit}"
+          args=(-f "tag_name=$TAG")
+          [ -z "$previous" ] || args+=(-f "previous_tag_name=$previous")
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "pip install --upgrade cfn2iam==$version   # or: uv tool install cfn2iam==$version"
+            echo '```'
+            echo
+            echo "On PyPI: https://pypi.org/project/cfn2iam/$version/"
+            echo
+            gh api --method POST "repos/$GH_REPO/releases/generate-notes" "${args[@]}" --jq .body
+          } > notes.md
+          cat notes.md
+      - name: Create the Release
+        # Safe to re-run: if the Release already exists, only attach any distribution it lacks
+        # (and publish it if it was left a draft). Its notes, perhaps edited by hand, stay as they are.
+        run: |
+          version="${TAG#v}"
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            # --verify-tag: fail rather than create the tag if it isn't on GitHub.
+            gh release create "$TAG" dist/* --verify-tag --title "cfn2iam $version" --notes-file notes.md
+          else
+            echo "The Release for $TAG already exists; attaching any missing files."
+            attached=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+            for file in dist/*; do
+              grep -qxF "$(basename "$file")" <<< "$attached" || gh release upload "$TAG" "$file"
+            done
+            if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
+              gh release edit "$TAG" --draft=false
+            fi
+          fi
+          gh release view "$TAG" --json url,assets --jq '.url, (.assets[] | "  \(.name)")'
+
   publish:
     name: Upload to PyPI
     needs: test
