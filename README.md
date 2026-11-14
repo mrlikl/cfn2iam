@@ -99,7 +99,27 @@ uv lock --check                           # uv.lock matches pyproject.toml
 uv build && uvx twine check --strict dist/*
 ```
 
-CI also runs the tests on every Python from 3.11 to 3.15 on Linux (and the oldest and newest on macOS and Windows), installs the built wheel into a clean environment and runs the CLI on `samples/`, and installs the wheel in [Pyodide](https://pyodide.org/) to check that `cfn2iam.core` still runs in the browser (`tests/pyodide/smoke.mjs`). Pushing a `vX.Y.Z` tag on `main` runs all of that and then publishes to PyPI.
+CI also runs the tests on every Python from 3.11 to 3.15 on Linux (and the oldest and newest on macOS and Windows), installs the built wheel into a clean environment and runs the CLI on `samples/`, and installs the wheel in [Pyodide](https://pyodide.org/) to check that `cfn2iam.core` still runs in the browser (`tests/pyodide/smoke.mjs`).
+
+### Releasing
+
+Merge everything for the release into `main` through pull requests, then tag the merge commit and push the tag:
+
+```bash
+git switch main && git pull
+git tag v0.3.1 && git push origin v0.3.1
+```
+
+The tag starts `.github/workflows/publish.yml`, which:
+
+1. checks that the tag is a full `vX.Y.Z` version and that its commit is on `main`;
+2. runs the whole test workflow above, including the build;
+3. uploads that build's wheel and sdist to [PyPI](https://pypi.org/project/cfn2iam/) with trusted publishing (the `pypi` environment);
+4. once the upload has succeeded, checks the files against what PyPI serves and creates the [GitHub Release](https://github.com/mrlikl/cfn2iam/releases) for the tag, with the same wheel and sdist attached.
+
+The version comes from the tag (hatch-vcs), so there is nothing to bump in the code. If any step fails, nothing after it runs: no upload without a green test run, and no Release without a successful upload. A moving tag such as `v1` never publishes or creates a Release. After fixing the cause of a failed Release step, use **Re-run failed jobs** on the run; the release job skips what already exists.
+
+The release notes are GitHub's generated notes: install instructions for the version, then the pull requests merged since the previous `vX.Y.Z` tag, grouped by label as set in `.github/release.yml` (`breaking`, `enhancement`, `bug` and `documentation`; unlabelled pull requests under "Changes"; Dependabot's under "Dependency updates"). So the changelog is the pull request titles: give them titles that make sense to a user. There is no `CHANGELOG.md` to update. Notes can be edited on GitHub after the Release is created, and a re-run leaves them alone.
 
 ## License
 

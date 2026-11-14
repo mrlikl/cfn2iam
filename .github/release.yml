@@ -1,0 +1,21 @@
+# How GitHub groups the pull requests merged since the previous version tag in a Release's
+# generated notes. publish.yml asks for these notes when it creates the Release for a tag.
+# A pull request lands in the first category whose labels it has; with no label it goes under
+# "Changes", so labelling is optional. Dependabot labels its pull requests "dependencies".
+
+changelog:
+  categories:
+    - title: Breaking changes
+      labels: [breaking]
+    - title: New features
+      labels: [enhancement]
+    - title: Fixes
+      labels: [bug]
+    - title: Documentation
+      labels: [documentation]
+    - title: Changes
+      labels: ["*"]
+      exclude:
+        labels: [dependencies]
+    - title: Dependency updates
+      labels: [dependencies]
