@@ -484,6 +484,8 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
         notices.append(("error", compare.headline(report)))
     elif drift:
         notices.append(("warning", compare.headline(report)))
+    elif wrote_baseline:
+        notices.append(("notice", f"Wrote the generated policy to {baseline_path}; commit it to accept it."))
     elif baseline_status == "missing":
         notices.append(("notice", f"Baseline {', '.join(inputs.baseline)} does not exist yet; see the job summary."))
     changed = bool(errors) or report is None or report.changed or baseline_status != "found"

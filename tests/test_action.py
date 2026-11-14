@@ -199,6 +199,9 @@ def test_update_baseline_writes_the_policy(repo):
     written = json.loads((repo / "iam" / "new" / "baseline.json").read_text())
     assert written == json.loads(Path(result.outputs["policy-path"]).read_text())
     assert "wrote the generated policy to `iam/new/baseline.json`" in result.markdown_comment
+    assert result.notices == [
+        ("notice", "Wrote the generated policy to iam/new/baseline.json; commit it to accept it.")
+    ]
     again = run(repo, baseline="iam/new/baseline.json")
     assert again.exit_code == 0 and not again.changed
 
