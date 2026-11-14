@@ -1,0 +1,8 @@
+# A queue, and a custom resource whose permissions cfn2iam can't know: the report must say it skipped it.
+Resources:
+  Queue:
+    Type: AWS::SQS::Queue
+  Seed:
+    Type: Custom::SeedQueue
+    Properties:
+      ServiceToken: arn:aws:lambda:us-east-1:123456789012:function:seed

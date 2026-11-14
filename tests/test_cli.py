@@ -73,6 +73,43 @@ def test_output_path(tmp_path):
     assert "iam.json" in result.stdout
 
 
+def test_output_path_creates_parent_directories(tmp_path):
+    result = run([template(tmp_path), "-o", "iam/new/deploy-policy.json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads((tmp_path / "iam" / "new" / "deploy-policy.json").read_text()) == EXPECTED_POLICY
+
+
+def test_create_role_checks_credentials_before_writing_anything(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "aws_credentials_problem", lambda: 'your AWS credentials come from "aws login"')
+    result = run([template(tmp_path), "-c", "-o", "p.json"])
+    assert result.exit_code == 1
+    assert 'Error: --create-role can\'t run: your AWS credentials come from "aws login". No policy was written.' in (
+        result.stderr
+    )
+    assert not (tmp_path / "p.json").exists()
+
+
+def test_messages_keep_their_order_when_piped(tmp_path):
+    # stdout to a pipe is block-buffered: unflushed, "Generated ..." came out after the error that followed it.
+    script = f"""
+import sys
+from cfn2iam import app
+app._fetch_json = lambda url: {BUCKET!r} if url.endswith("AWS_S3_Bucket.json") else (_ for _ in ()).throw(app.NotFound(url))
+app.aws_credentials_problem = lambda: None
+def fail(policy, name, boundary=None):
+    print("Error: failed to create IAM role " + name, file=sys.stderr)
+app.create_iam_role = fail
+sys.argv = ["cfn2iam", {template(tmp_path)!r}, "-c", "-o", "p.json"]
+app.app()
+"""
+    out = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    ).stdout
+    lines = [line for line in out.splitlines() if not line.startswith("Warning: ")]
+    assert lines[0] == "Generated IAM Policy Document to p.json", out
+    assert lines[1].startswith("Error: failed to create IAM role"), out
+
+
 def test_policy_to_stdout(tmp_path):
     result = run([template(tmp_path), "-o", "-"])
     assert result.exit_code == 0, result.output
@@ -169,6 +206,14 @@ def test_diff_json_and_markdown(tmp_path):
     result = diff([gen, "-b", base, "--format", "markdown", "-o", "report.md"])
     assert result.exit_code == 0 and result.stdout == ""
     assert (tmp_path / "report.md").read_text().startswith("### cfn2iam permission check")
+
+
+def test_diff_creates_parent_directories(tmp_path):
+    gen = write(tmp_path, "gen.json", EXPECTED_POLICY)
+    result = diff([gen, "-b", gen, "-o", "out/report.txt", "-w", "iam/new/baseline.json"])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "out" / "report.txt").read_text().startswith("No permission changes")
+    assert json.loads((tmp_path / "iam" / "new" / "baseline.json").read_text()) == EXPECTED_POLICY
 
 
 def test_diff_without_baseline_writes_the_combined_policy(tmp_path):

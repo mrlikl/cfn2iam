@@ -1,7 +1,6 @@
 name: cfn2iam IAM permission check
 description: >-
-  Check the IAM permissions CloudFormation and SAM templates need against a committed baseline policy,
-  comment the change on the pull request, and fail on permission drift.
+  Check the IAM permissions CloudFormation and SAM templates need against a baseline policy and report drift on pull requests.
 author: S Murali Krishnan
 branding:
   icon: shield
@@ -56,11 +55,14 @@ inputs:
   update-baseline:
     description: >-
       Write the generated policy to the baseline file instead of failing on drift, for a workflow that accepts a
-      change (commit the file afterwards). Needs exactly one baseline file.
+      change (commit the file afterwards). Needs exactly one baseline file. The outputs then describe the new
+      baseline (no drift); the report says what changed.
     required: false
     default: "false"
   name:
-    description: A name for this check, when a workflow runs the action more than once. Each name gets its own comment.
+    description: >-
+      A name for this check. Give every invocation in a workflow its own name: invocations with the same name (or
+      none) share one pull request comment, and each replaces the other's report.
     required: false
     default: ""
   region:
@@ -106,8 +108,13 @@ outputs:
   baseline-status:
     description: found, missing (the baseline file does not exist yet) or none (no baseline input).
     value: ${{ steps.check.outputs.baseline-status }}
+  baseline-updated:
+    description: true when update-baseline wrote the generated policy to the baseline file.
+    value: ${{ steps.check.outputs.baseline-updated }}
   policy-path:
-    description: Path of the generated policy, all templates combined.
+    description: >-
+      Path of the generated policy, all templates combined. On Windows it has backslashes: pass it to a bash step
+      through env, not by writing the expression into the script.
     value: ${{ steps.check.outputs.policy-path }}
   report-path:
     description: Path of the report, in Markdown (the job summary's text).
@@ -119,8 +126,10 @@ outputs:
     description: URL of the pull request comment.
     value: ${{ steps.check.outputs.comment-url }}
   error:
-    description: true when the check could not run (a template missing or unresolvable, an invalid baseline).
-    value: ${{ steps.check.outputs.error }}
+    description: >-
+      true when the check could not run (an invalid input, cfn2iam failed to install, a template missing or
+      unresolvable, an invalid baseline).
+    value: ${{ steps.check.outputs.error || steps.install.outputs.error }}
 
 runs:
   using: composite
@@ -142,11 +151,26 @@ runs:
         REGISTRY_FALLBACK: ${{ inputs.registry-fallback }}
       run: |
         set -euo pipefail
+        # Any failure here means the check could not run: say so in the error output.
+        trap 'echo "error=true" >> "$GITHUB_OUTPUT"' ERR
+        case "$REGISTRY_FALLBACK" in
+          true | false | "") ;;
+          *) echo "::error title=cfn2iam::registry-fallback must be true or false, not '$REGISTRY_FALLBACK'"; false ;;
+        esac
         venv="$RUNNER_TEMP/cfn2iam-action-venv"
         if [ ! -e "$GITHUB_ACTION_PATH/.git" ]; then
-          # A downloaded action has no git history for hatch-vcs to read the version from.
+          # A downloaded action has no git history for hatch-vcs to read the version from. GitHub
+          # fills in .git_archival.txt when it serves the archive, so a moving tag such as @v0 or a
+          # commit SHA still reports the release it is (or follows).
+          describe=$(sed -n 's/^describe-name: //p' "$GITHUB_ACTION_PATH/.git_archival.txt" 2>/dev/null || true)
           if [[ "$ACTION_REF" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             export SETUPTOOLS_SCM_PRETEND_VERSION="${BASH_REMATCH[1]}"
+          elif [[ "$describe" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            export SETUPTOOLS_SCM_PRETEND_VERSION="${BASH_REMATCH[1]}"
+          elif [[ "$describe" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-([0-9]+)-g([0-9a-f]+)$ ]]; then
+            # Commits after a release: the development version setuptools-scm would give.
+            m=("${BASH_REMATCH[@]}")
+            export SETUPTOOLS_SCM_PRETEND_VERSION="${m[1]}.${m[2]}.$((m[3] + 1)).dev${m[4]}+g${m[5]}"
           else
             local_label=$(printf '%s' "${ACTION_REF:-unknown}" | tr -c 'A-Za-z0-9' '.' | cut -c1-40 | sed 's/^\.*//; s/\.*$//')
             export SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+${local_label:-unknown}"

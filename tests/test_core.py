@@ -119,6 +119,35 @@ def test_ignored_and_malformed_resources():
     )
     assert result.resource_types == []
     assert result.policy == {"Version": "2012-10-17", "Statement": []}
+    # Custom resources are reported, so no front end shows the policy as complete; CDK metadata needs nothing.
+    assert result.skipped_resources == [
+        {"logical_id": "C", "type": "Custom::Thing"},
+        {"logical_id": "R", "type": "AWS::CloudFormation::CustomResource"},
+    ]
+    assert result.to_dict()["skipped_resources"] == result.skipped_resources
+    [warning] = result.warnings
+    assert warning.startswith("Skipped 2 custom resources: C (Custom::Thing), R (AWS::CloudFormation::CustomResource).")
+    assert "lambda:InvokeFunction" in warning
+
+
+def test_no_custom_resources_no_notice():
+    result = analyze({"Resources": {"B": {"Type": "AWS::S3::Bucket"}, "M": {"Type": "AWS::CDK::Metadata"}}})
+    assert result.skipped_resources == [] and result.warnings == []
+
+
+def test_resources_in_foreach_loops_count():
+    template = {
+        "Transform": "AWS::LanguageExtensions",
+        "Resources": {
+            "Fn::ForEach::Buckets": ["Name", ["A", "B"], {"Bucket${Name}": {"Type": "AWS::S3::Bucket"}}],
+            "Fn::ForEach::Outer": [
+                "X",
+                ["1"],
+                {"Fn::ForEach::Inner": ["Y", ["2"], {"Fn${X}${Y}": {"Type": "AWS::Lambda::Function"}}]},
+            ],
+        },
+    }
+    assert analyze(template).resource_types == ["AWS::Lambda::Function", "AWS::S3::Bucket"]
 
 
 def test_template_without_resources_fetches_nothing():
@@ -333,6 +362,121 @@ def test_lookup_of_an_unknown_type():
     assert lookup("AWS::Nope::Nope").unresolved == {"AWS::Nope::Nope": "no published schema"}
 
 
+# --- Transforms ---------------------------------------------------------------------
+
+SAM_TRANSFORM_STATEMENT = {
+    "Effect": "Allow",
+    "Action": ["cloudformation:CreateChangeSet"],
+    "Resource": "arn:*:cloudformation:*:aws:transform/Serverless-2016-10-31",
+}
+
+
+def test_sam_transform_is_granted():
+    # repro-sam-transform: with a service role, CloudFormation runs the transform as the role, and every SAM
+    # deploy failed with "not authorized to perform: cloudformation:CreateChangeSet on resource:
+    # arn:aws:cloudformation:<region>:aws:transform/Serverless-2016-10-31".
+    files = dict(BACKEND)
+    files["sam_rules/AWS_Serverless_SimpleTable.json"] = {"base_resources": ["AWS::S3::Bucket"]}
+    result = analyze(
+        "Transform: AWS::Serverless-2016-10-31\nResources:\n  Table:\n    Type: AWS::Serverless::SimpleTable\n",
+        backend(files),
+    )
+    assert result.policy["Statement"] == [
+        {
+            "Effect": "Allow",
+            "Action": ["s3:CreateBucket", "s3:GetBucketTagging", "s3:PutBucketTagging"],
+            "Resource": "*",
+        },
+        SAM_TRANSFORM_STATEMENT,
+        {"Effect": "Deny", "Action": ["s3:DeleteBucket"], "Resource": "*"},
+    ]
+    assert result.transforms == [
+        {
+            "name": "AWS::Serverless-2016-10-31",
+            "actions": ["cloudformation:CreateChangeSet"],
+            "resources": ["arn:*:cloudformation:*:aws:transform/Serverless-2016-10-31"],
+        }
+    ]
+    assert "cloudformation:CreateChangeSet" in result.allow
+    assert result.to_dict()["transforms"] == result.transforms
+    assert result.warnings == []
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        "AWS::Serverless-2016-10-31",
+        ["AWS::Serverless-2016-10-31"],
+        ["AWS::LanguageExtensions", "AWS::Serverless-2016-10-31"],
+        [{"Name": "AWS::Serverless-2016-10-31"}],
+    ],
+)
+def test_transform_forms(transform):
+    result = analyze({"Transform": transform, "Resources": {"B": {"Type": "AWS::S3::Bucket"}}})
+    names = [t["name"] for t in result.transforms]
+    assert "AWS::Serverless-2016-10-31" in names
+    [statement] = [s for s in result.policy["Statement"] if s["Action"] == ["cloudformation:CreateChangeSet"]]
+    expected = [core.transform_arn(n) for n in names]
+    assert statement["Resource"] == (expected[0] if len(expected) == 1 else sorted(expected))
+
+
+def test_every_aws_transform_and_macro_is_granted():
+    # Seen in a real account with a service role: AWS::LanguageExtensions and AWS::Include are checked like the SAM
+    # transform (account "aws"), and a macro on the deploying account's transform ARN.
+    text = """
+Transform: [AWS::LanguageExtensions, MyMacro]
+Resources:
+  B:
+    Type: AWS::S3::Bucket
+  Fn::Transform:
+    Name: AWS::Include
+    Parameters:
+      Location: s3://my-bucket/snippet.yaml
+  F:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: !Transform {Name: AWS::Include, Parameters: {Location: s3://other/code.yaml}}
+"""
+    result = analyze(text)
+    assert [t["name"] for t in result.transforms] == ["AWS::LanguageExtensions", "MyMacro", "AWS::Include"]
+    [statement] = [s for s in result.policy["Statement"] if s["Action"] == ["cloudformation:CreateChangeSet"]]
+    assert statement["Resource"] == [
+        "arn:*:cloudformation:*:*:transform/MyMacro",
+        "arn:*:cloudformation:*:aws:transform/Include",
+        "arn:*:cloudformation:*:aws:transform/LanguageExtensions",
+    ]
+    assert any(
+        "s3://my-bucket/snippet.yaml, s3://other/code.yaml" in w and "s3:GetObject" in w for w in result.warnings
+    )
+    assert any(w.startswith("Transform MyMacro is a macro") for w in result.warnings)
+
+
+def test_transform_action_is_never_denied():
+    files = dict(BACKEND)
+    files["schemas/AWS_S3_Bucket.json"] = {
+        "handlers": {
+            "create": {"permissions": ["s3:CreateBucket"]},
+            "delete": {"permissions": ["cloudformation:CreateChangeSet"]},
+        }
+    }
+    result = analyze(
+        {"Transform": "AWS::LanguageExtensions", "Resources": {"B": {"Type": "AWS::S3::Bucket"}}}, backend(files)
+    )
+    assert result.delete == []
+    assert all(s["Effect"] == "Allow" for s in result.policy["Statement"])
+
+
+def test_sam_resources_without_the_transform_are_flagged():
+    result = analyze({"Resources": {"F": {"Type": "AWS::Serverless::Function"}}})
+    assert any("no Transform: AWS::Serverless-2016-10-31" in w for w in result.warnings)
+    assert result.transforms == []
+
+
+def test_without_a_transform_the_policy_is_unchanged():
+    result = analyze({"Resources": {"B": {"Type": "AWS::S3::Bucket"}}})
+    assert result.transforms == [] and len(result.policy["Statement"]) == 2
+
+
 # --- What the web page relies on ------------------------------------------------
 
 
@@ -353,6 +497,8 @@ def test_to_dict_is_json_ready():
         "warnings",
         "scoping",
         "policy_size",
+        "transforms",
+        "skipped_resources",
     }
     assert data["scoping"] is None  # no account given
     assert data["by_type"]["MyOrg::Private::Thing"] == {

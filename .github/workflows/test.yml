@@ -173,6 +173,7 @@ jobs:
           for template in cfn.json sam.yaml; do
             rm -f policy-*.json
             cfn2iam "$GITHUB_WORKSPACE/samples/$template" --account 123456789012 --region us-east-1
+            # shellcheck disable=SC2016 # a literal ${ in the Python check
             python -I -c 'import glob, json; [f] = glob.glob("policy-*.json"); s = json.load(open(f))["Statement"]; arns = [r for x in s if x["Effect"] == "Allow" for r in ([x["Resource"]] if isinstance(x["Resource"], str) else x["Resource"]) if r != "*"]; assert arns and all(r.count(":") >= 5 and "${" not in r for r in arns), s; assert all(x["Resource"] == "*" for x in s if x["Effect"] == "Deny"), s; print(f, len(s), "statements,", len(arns), "ARNs")'
           done
 
@@ -268,10 +269,33 @@ jobs:
           baseline: ${{ runner.temp }}/baselines/cfn.json
           update-baseline: true
           comment: never
-      - name: The baseline is the generated policy
+      - name: The baseline is the generated policy, and the outputs describe it
         env:
           POLICY: ${{ steps.accept.outputs.policy-path }}
-        run: cmp "$POLICY" "$RUNNER_TEMP/baselines/cfn.json"
+          OUT: ${{ toJSON(steps.accept.outputs) }}
+        run: |
+          cmp "$POLICY" "$RUNNER_TEMP/baselines/cfn.json"
+          jq -e '.["baseline-updated"] == "true" and .drift == "false" and .error == "false"' <<< "$OUT"
+
+      - name: "Accept a change: update a baseline that drifted"
+        run: |
+          mkdir -p "$RUNNER_TEMP/drifted"
+          cp tests/fixtures/action/drift-baseline.json "$RUNNER_TEMP/drifted/policy.json"
+      - id: update-drifted
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: ${{ runner.temp }}/drifted/policy.json
+          update-baseline: true
+          comment: never
+      - name: After the update, no drift is reported
+        env:
+          OUT: ${{ toJSON(steps.update-drifted.outputs) }}
+        run: |
+          echo "$OUT"
+          jq -e '.drift == "false" and .["added-count"] == "0" and .["baseline-updated"] == "true" and .["baseline-status"] == "found"' <<< "$OUT"
+          # The report still says what the update accepted.
+          grep -q 'Permission drift' "$(jq -r '.["report-path"]' <<< "$OUT")"
 
       - name: "No drift: the baseline grants what the template needs"
         id: same
@@ -389,6 +413,70 @@ jobs:
           grep -q 'Resources scoped to account `123456789012`, region `us-east-1`' "$(jq -r '.["report-path"]' <<< "$SCOPED")"
           jq -e '[.Statement[] | select(.Effect == "Allow") | .Resource | if type == "string" then [.] else . end | .[] | select(startswith("arn:aws:"))] | length > 0' "$RUNNER_TEMP/baselines/scoped.json"
           jq -e '.drift == "true" and (.["conditional-count"] | tonumber) > 0' <<< "$UNSCOPED"
+
+      - name: "Custom resources are reported as skipped"
+        id: custom
+        uses: ./
+        with:
+          templates: tests/fixtures/action/custom-resource.yaml
+          comment: never
+          name: custom
+      - name: The report and the comment name the custom resource
+        env:
+          OUT: ${{ toJSON(steps.custom.outputs) }}
+        run: |
+          report=$(jq -r '.["report-path"]' <<< "$OUT")
+          grep -q 'Skipped 1 custom resource: Seed (Custom::SeedQueue)' "$report"
+          grep -q 'Skipped 1 custom resource: Seed (Custom::SeedQueue)' "$(dirname "$report")/comment.md"
+
+      - name: "A comment cut to fit, under a name with markup"
+        id: short
+        uses: ./
+        env:
+          CFN2IAM_ACTION_COMMENT_LIMIT: "4000"
+        with:
+          templates: samples/cfn.json
+          baseline: tests/fixtures/action/drift-baseline.json
+          fail-on-drift: false
+          comment: never
+          name: "prod --> <b>x</b>"
+      - name: The comment says it was shortened, and its marker is intact
+        env:
+          OUT: ${{ toJSON(steps.short.outputs) }}
+        run: |
+          comment="$(dirname "$(jq -r '.["report-path"]' <<< "$OUT")")/comment.md"
+          head -n 1 "$comment"
+          [ "$(head -n 1 "$comment")" = '<!-- cfn2iam-action:prod --%3E %3Cb%3Ex%3C/b%3E -->' ]
+          [ "$(wc -c < "$comment")" -le 4000 ]
+          grep -q "This comment is shortened to fit GitHub's size limit" "$comment"
+          grep -q 'The generated policy is left out of this comment for length' "$comment"
+          # The job summary keeps everything.
+          grep -q '"Version": "2012-10-17"' "$(jq -r '.["report-path"]' <<< "$OUT")"
+
+      - name: "Error: an invalid input to the install step"
+        id: bad-input
+        continue-on-error: true
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          registry-fallback: "yes"
+          comment: never
+      - name: "Error: cfn2iam can't be installed (no such Python)"
+        id: bad-python
+        continue-on-error: true
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          python-version: "3.10"
+          comment: never
+      - name: Both failed with the error output set
+        env:
+          BAD_INPUT: ${{ toJSON(steps.bad-input) }}
+          BAD_PYTHON: ${{ toJSON(steps.bad-python) }}
+        run: |
+          echo "$BAD_INPUT"; echo "$BAD_PYTHON"
+          jq -e '.outcome == "failure" and .outputs.error == "true"' <<< "$BAD_INPUT"
+          jq -e '.outcome == "failure" and .outputs.error == "true"' <<< "$BAD_PYTHON"
 
       - name: "Error: a template that does not exist"
         id: no-template

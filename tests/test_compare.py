@@ -143,6 +143,15 @@ def test_action_the_baseline_denies_is_not_granted():
     [finding] = report.added
     assert (finding.action, finding.status) == ("s3:DeleteBucket", "denied")
     assert finding.reasons == ["denied by baseline0.json, statement 2"]
+    # It is reported once, as denied: the Deny still matters, so it isn't also "no longer denied".
+    assert report.no_longer_denied == []
+
+
+def test_a_hand_written_deny_on_a_needed_action_is_listed_once():
+    baseline = policy(allow("s3:*"), deny(["s3:PutBucketPolicy", "s3:PutBucketAcl"]))
+    report = check(policy(allow(["s3:CreateBucket", "s3:PutBucketPolicy"])), baseline)
+    assert actions(report.not_granted) == ["s3:PutBucketPolicy"]
+    assert actions(report.no_longer_denied) == ["s3:PutBucketAcl"]  # matches nothing the templates need
 
 
 def test_allow_delete_output_needs_the_delete_actions():
@@ -381,6 +390,39 @@ def test_markdown_fits_the_limit():
     short = compare.render_markdown(report, max_length=20000)
     assert len(full) > 20000 >= len(short)
     assert "left out for length" in short
+    noted = compare.render_markdown(report, max_length=20000, shortened_note="See the job summary.")
+    assert len(noted) <= 20000 and "See the job summary." in noted
+    assert "See the job summary." not in compare.render_markdown(report, shortened_note="See the job summary.")
+
+
+def test_shortened_note_only_when_details_were_dropped():
+    report = check(policy(allow(["s3:CreateBucket"])), policy(allow("nothing:*")))
+    assert "NOTE-X" not in compare.render_markdown(report, max_length=65536, shortened_note="NOTE-X")
+    tiny = compare.render_markdown(report, max_length=120, shortened_note="NOTE-X")
+    assert len(tiny) <= 120 and tiny.rstrip().endswith("NOTE-X")
+
+
+def test_transforms_say_who_needs_the_action():
+    data = detailed(
+        "sam.yaml", ["s3:CreateBucket"], by_type={"AWS::S3::Bucket": {"allow": ["s3:CreateBucket"], "delete": []}}
+    )
+    data["policy"]["Statement"].append(
+        allow(["cloudformation:CreateChangeSet"], "arn:*:cloudformation:*:aws:transform/Serverless-2016-10-31")
+    )
+    data["allow"].append("cloudformation:CreateChangeSet")
+    data["transforms"] = [
+        {
+            "name": "AWS::Serverless-2016-10-31",
+            "actions": ["cloudformation:CreateChangeSet"],
+            "resources": ["arn:*:cloudformation:*:aws:transform/Serverless-2016-10-31"],
+        }
+    ]
+    report = check([("sam.json", data)], policy(allow("s3:*")))
+    [finding] = report.added
+    assert finding.action == "cloudformation:CreateChangeSet"
+    assert finding.needed_by == [("sam.yaml", "Transform AWS::Serverless-2016-10-31")]
+    # A baseline that grants the transform's ARN, or "*", covers it.
+    assert not check([("sam.json", data)], policy(allow("*"))).drift
 
 
 def test_text_report():
