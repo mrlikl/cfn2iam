@@ -22,7 +22,7 @@ dependencies = [
     "PyYAML>=6.0.3",
     "typer>=0.21.1"
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
 [project.optional-dependencies]
 iam = ["boto3>=1.26"]
@@ -37,6 +37,9 @@ cfn2iam = "cfn2iam.app:app"
 
 [tool.hatch.version]
 source = "vcs"
+# Derive the version from full release tags (v0.3.0) only. Without --match, a moving tag such
+# as v1 for the GitHub Action would win `git describe` and build as version "1" or "2.dev0".
+raw-options = { scm = { git = { describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--abbrev=40", "--match", "v[0-9]*.[0-9]*.[0-9]*"] } } }
 
 [tool.hatch.build.targets.wheel]
 packages = ["cfn2iam"]
@@ -44,4 +47,27 @@ packages = ["cfn2iam"]
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
+    "ruff>=0.17.4",
 ]
+
+[tool.ruff]
+line-length = 120
+# target-version comes from requires-python (3.11).
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "B",        # bugbear
+    "UP",       # pyupgrade, for syntax every supported Python allows
+    "ASYNC",    # blocking calls inside async code
+]
+ignore = [
+    "E501",            # line length is the formatter's job, and it leaves long strings alone
+    "UP006", "UP035",  # keep typing.Dict/List/Tuple, the annotation style used throughout
+    "UP007", "UP045",  # likewise typing.Optional/Union
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

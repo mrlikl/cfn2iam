@@ -1,21 +1,43 @@
 version: 2
+
+# Weekly, with minor and patch updates grouped into one pull request per ecosystem and each
+# major update on its own. Commit messages and labels are Dependabot's defaults ("Bump ...",
+# labelled dependencies plus the ecosystem), as on the pull requests so far.
+
 updates:
+  # pyproject.toml and uv.lock (runtime dependencies, the iam extra and the dev group).
   - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "06:00"
     cooldown:
       default-days: 7 # skip releases younger than a week
+    # cfn2iam is a library on PyPI: its lower bounds are what users may install, so only
+    # raise one when the new version falls outside it. uv.lock is updated either way.
+    versioning-strategy: "increase-if-necessary"
     groups:
       python:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      python-security:
+        applies-to: security-updates
         patterns: ["*"]
 
+  # Workflows in .github/workflows (and a root action.yml, once there is one). Actions are
+  # pinned by commit SHA with the version in a comment; Dependabot updates both.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "06:00"
     cooldown:
       default-days: 7
     groups:
       actions:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["minor", "patch"]

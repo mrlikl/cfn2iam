@@ -1,29 +1,230 @@
 name: Test
 
+# The full gate: lint, tests on every supported Python and OS, the cfn2iam[iam] extra, the
+# built distributions, the installed CLI, and the core that the web version runs in Pyodide.
+# publish.yml calls this workflow and uploads the exact dist/ its build job produced.
+
 on:
   push:
     branches: [main]
   pull_request:
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  # A new push to a pull request cancels its superseded run. Pushes to main and release runs
+  # (called from publish.yml on a tag) are never cancelled part way.
+  group: test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# setup-uv caches uv's downloads on GitHub-hosted runners, keyed on uv.lock and pyproject.toml.
+# It skips the cache on tag pushes, so a release never restores what an earlier run saved.
+
 jobs:
-  test:
+  lint:
+    name: Lint, format and lockfile
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
+      - name: ruff check
+        run: uv run --locked --only-dev ruff check --output-format=github .
+      - name: ruff format
+        run: uv run --locked --only-dev ruff format --check --diff .
+
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        # Oldest supported and current.
-        python-version: ["3.9", "3.13"]
+        # Every released Python that requires-python (>=3.11) allows, on Linux.
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+        # The CLI reads templates and writes policy files, so run the oldest and newest
+        # Python on macOS and Windows too (paths, default file encoding, line endings).
+        include:
+          - { os: macos-latest, python-version: "3.11" }
+          - { os: macos-latest, python-version: "3.15" }
+          - { os: windows-latest, python-version: "3.11" }
+          - { os: windows-latest, python-version: "3.15" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # hatch-vcs derives the version from tags
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
-      - run: uv run pytest -q
+      - run: uv run --locked pytest -q -rs
+
+  iam:
+    name: Test with cfn2iam[iam] (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked --extra iam
+      - name: The boto3 code paths import
+        run: >-
+          uv run --locked --extra iam python -c
+          "import boto3, botocore.exceptions, botocore.stub; from cfn2iam import app; assert app._has_boto3()"
+      # Includes tests/test_iam_extra.py, which is skipped when boto3 isn't installed.
+      - run: uv run --locked --extra iam pytest -q -rs
+
+  build:
+    name: Build and check distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # hatch-vcs derives the version from tags
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - run: uv build
+      - name: twine check
+        # In its own environment, so twine's dependencies never enter the project's lock.
+        run: uvx twine@7.0.0 check --strict dist/*
+      - name: The wheel holds the core and the CLI
+        run: |
+          python3 -m zipfile -l dist/*.whl
+          python3 -m zipfile -l dist/*.whl | grep -q 'cfn2iam/core.py'
+          python3 -m zipfile -l dist/*.whl | grep -q 'cfn2iam/app.py'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  wheel:
+    name: Installed CLI (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.15"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # only for samples/
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Install the wheel into a clean virtual environment
+        # Dependencies resolve from PyPI within the wheel's metadata, as for a user; uv.lock isn't used.
+        run: |
+          venv="$RUNNER_TEMP/venv"
+          uv venv "$venv"
+          uv pip install --python "$venv" dist/*.whl
+          if [ "$RUNNER_OS" = Windows ]; then echo "$venv/Scripts" >> "$GITHUB_PATH"; else echo "$venv/bin" >> "$GITHUB_PATH"; fi
+      - name: Run the CLI on samples/
+        # Fetches the published schemas from mrlikl.github.io, as every real run does.
+        run: |
+          wheel=$(basename dist/*.whl)
+          expected="cfn2iam $(echo "$wheel" | cut -d- -f2)"
+          mkdir "$RUNNER_TEMP/run" && cd "$RUNNER_TEMP/run" # away from the checkout's cfn2iam/
+          actual=$(cfn2iam --version | tr -d '\r')
+          echo "$actual"
+          [ "$actual" = "$expected" ] || { echo "::error::cfn2iam --version printed '$actual', expected '$expected'"; exit 1; }
+          for template in cfn.json sam.yaml; do
+            rm -f policy-*.json
+            cfn2iam "$GITHUB_WORKSPACE/samples/$template"
+            python -I -c 'import glob, json; [f] = glob.glob("policy-*.json"); s = json.load(open(f))["Statement"]; assert s and all(x["Action"] for x in s), s; print(f, [(x["Effect"], len(x["Action"])) for x in s])'
+          done
+
+  core:
+    name: Core without CLI dependencies (CPython and Pyodide)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Keep in step with PYODIDE_VERSION in the web version (mrlikl.github.io, cfn2iam/app.js).
+      PYODIDE_VERSION: "314.0.7"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # only for tests/pyodide/
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.14" # the Python in Pyodide 314
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Import and run cfn2iam.core with only PyYAML installed
+        run: |
+          venv="$RUNNER_TEMP/core-only"
+          uv venv "$venv"
+          uv pip install --python "$venv" --no-deps dist/*.whl
+          uv pip install --python "$venv" PyYAML
+          cd "$RUNNER_TEMP"
+          "$venv/bin/python" -I - <<'EOF'
+          import asyncio, importlib.util, sys
+          for name in ("typer", "click", "boto3"):
+              assert importlib.util.find_spec(name) is None, f"{name} is installed, so this check proves nothing"
+          from cfn2iam import core
+          schema = {"handlers": {"create": {"permissions": ["s3:CreateBucket"]}, "delete": {"permissions": ["s3:DeleteBucket"]}}}
+          def fetch_json(path):
+              if path == "schemas/AWS_S3_Bucket.json":
+                  return schema
+              raise core.NotFound(path)
+          analysis = asyncio.run(core.analyze_template("Resources: {B: {Type: AWS::S3::Bucket}}", fetch_json))
+          assert analysis.allow == ["s3:CreateBucket"] and analysis.delete == ["s3:DeleteBucket"], analysis
+          loaded = sorted(m for m in ("typer", "click", "boto3", "urllib.request", "cfn2iam.app") if m in sys.modules)
+          assert not loaded, f"cfn2iam.core pulled in {loaded}"
+          print("cfn2iam.core OK with only PyYAML")
+          EOF
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install the wheel in Pyodide with micropip and run the core
+        run: |
+          npm install --no-save --no-audit --no-fund --ignore-scripts --prefix "$RUNNER_TEMP/pyodide" "pyodide@$PYODIDE_VERSION"
+          node tests/pyodide/smoke.mjs "$RUNNER_TEMP/pyodide/node_modules/pyodide" dist/*.whl
+
+  # One stable check for branch protection to require, however the matrices above change.
+  ok:
+    name: All checks passed
+    if: always()
+    needs: [lint, test, iam, build, wheel, core]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
