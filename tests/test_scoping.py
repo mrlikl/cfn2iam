@@ -4,7 +4,7 @@ import asyncio
 import json
 
 import pytest
-from scoping_data import BACKEND, backend, template
+from scoping_data import BACKEND, LAMBDA, SQS, action, backend, schema, service, template
 
 from cfn2iam import core
 
@@ -132,12 +132,175 @@ def test_covers(a, b, covers):
     assert core._covers(a, b) is covers
 
 
+def always(base):
+    return True
+
+
 def test_reduce_drops_covered_and_collapses_long_runs():
-    assert core._reduce_arns({"arn:aws:s3:::*", "arn:aws:s3:::*/*"}) == ["arn:aws:s3:::*"]
+    assert core._reduce_arns({"arn:aws:s3:::*", "arn:aws:s3:::*/*"}, always) == ["arn:aws:s3:::*"]
     many = {f"arn:aws:ec2:r:1:t{i}/*" for i in range(core.COLLAPSE_AT + 1)} | {"arn:aws:ec2:r::image/*"}
-    assert core._reduce_arns(many) == ["arn:aws:ec2:r:1:*", "arn:aws:ec2:r::image/*"]
+    assert core._reduce_arns(many, always) == ["arn:aws:ec2:r:1:*", "arn:aws:ec2:r::image/*"]
+    assert core._reduce_arns(many, lambda base: False) == sorted(many)
     few = {f"arn:aws:ec2:r:1:t{i}/*" for i in range(core.COLLAPSE_AT)}
-    assert core._reduce_arns(few) == sorted(few)
+    assert core._reduce_arns(few, always) == sorted(few)
+
+
+# repro-s3-collapse: s3:TagResource and s3:ListTagsForResource act on five regional S3 resource types besides
+# buckets. 0.4.0 collapsed them to arn:aws:s3:<region>:<account>:*, which IAM rejects ("Resource
+# arn:aws:s3:ap-south-1:123456789012:* can not contain region information"): an S3 resource with no type
+# prefix is a bucket, and bucket ARNs have no region or account. The ARN formats are the published ones.
+S3_TAGGING = service(
+    "s3",
+    [
+        action("CreateBucket", "bucket"),
+        action("DeleteBucket", "bucket"),
+        action(
+            "TagResource",
+            "accessgrant",
+            "accessgrantsinstance",
+            "accessgrantslocation",
+            "accesspoint",
+            "bucket",
+            "storagelensgroup",
+        ),
+    ],
+    {
+        "bucket": ["arn:${Partition}:s3:::${BucketName}"],
+        "accessgrant": ["arn:${Partition}:s3:${Region}:${Account}:access-grants/default/grant/${Token}"],
+        "accessgrantsinstance": ["arn:${Partition}:s3:${Region}:${Account}:access-grants/default"],
+        "accessgrantslocation": ["arn:${Partition}:s3:${Region}:${Account}:access-grants/default/location/${Token}"],
+        "accesspoint": ["arn:${Partition}:s3:${Region}:${Account}:accesspoint/${AccessPointName}"],
+        "storagelensgroup": ["arn:${Partition}:s3:${Region}:${Account}:storage-lens-group/${Name}"],
+    },
+)
+S3_REGIONAL = [
+    "access-grants/default",
+    "access-grants/default/grant/*",
+    "access-grants/default/location/*",
+    "accesspoint/*",
+    "storage-lens-group/*",
+]
+
+
+@pytest.mark.parametrize("region", ["ap-south-1", None])
+def test_s3_resources_are_never_collapsed_to_a_bucket_arn_with_a_region(region):
+    files = dict(BACKEND)
+    files["servicereference/s3.json"] = S3_TAGGING
+    files["schemas/AWS_S3_Bucket.json"] = schema(["s3:CreateBucket", "s3:TagResource"], ["s3:DeleteBucket"])
+    result = analyze(template("AWS::S3::Bucket"), backend(files), account=ACCOUNT, region=region)
+    tag = statement_for(result, "s3:TagResource")
+    where = f"{region or '*'}:{ACCOUNT}"
+    assert resources(tag) == sorted(["arn:aws:s3:::*"] + [f"arn:aws:s3:{where}:{r}" for r in S3_REGIONAL])
+    arns = [a for s in statements(result) for a in resources(s)]
+    assert f"arn:aws:s3:{where}:*" not in arns
+    assert not any(a.startswith("arn:aws:s3:") and a.split(":", 5)[5] == "*" and a.split(":")[3] for a in arns)
+
+
+def test_lambda_types_are_still_collapsed():
+    # Lambda has no resource type without a prefix, so its many types collapse; IAM accepted that pattern.
+    files = dict(BACKEND)
+    many = {f"t{i}": [f"arn:${{Partition}}:lambda:${{Region}}:${{Account}}:t{i}:${{Name}}"] for i in range(7)}
+    files["servicereference/lambda.json"] = service("lambda", [action("TagResource", *many)], many)
+    files["schemas/AWS_Lambda_Function.json"] = schema(["lambda:TagResource"])
+    result = analyze(template("AWS::Lambda::Function"), backend(files), account=ACCOUNT, region="us-east-1")
+    assert statement_for(result, "lambda:TagResource")["Resource"] == f"arn:aws:lambda:us-east-1:{ACCOUNT}:*"
+
+
+def test_collapsible_reads_the_prefixless_resource_type():
+    reference = core._ServiceReference(None)
+    reference.services = {"s3": S3_TAGGING, "sqs": SQS, "lambda": LAMBDA}
+    assert not reference.collapsible(f"arn:aws:s3:us-east-1:{ACCOUNT}")
+    assert not reference.collapsible(f"arn:aws:s3:*:{ACCOUNT}")
+    assert not reference.collapsible(f"arn:aws:s3::{ACCOUNT}")
+    assert reference.collapsible("arn:aws:s3::")  # the bucket's own shape: arn:aws:s3:::* is a valid pattern
+    assert reference.collapsible(f"arn:aws:sqs:us-east-1:{ACCOUNT}")  # a queue name has region and account
+    assert reference.collapsible(f"arn:aws:lambda:us-east-1:{ACCOUNT}")  # no prefix-less type
+    assert not reference.collapsible(f"arn:aws:license-manager:us-east-1:{ACCOUNT}")  # its formats aren't loaded
+
+
+# --- Actions that stay on "*" despite the reference ------------------------------------------
+
+
+def test_event_source_mapping_lookups_stay_on_every_resource():
+    # repro-esm-delete: a scoped -d policy could not delete an AWS::Lambda::EventSourceMapping: "not authorized to
+    # perform: lambda:GetEventSourceMapping on resource: *", then lambda:DeleteEventSourceMapping on "*".
+    files = dict(BACKEND)
+    esm = "eventSourceMapping"
+    files["servicereference/lambda.json"] = service(
+        "lambda",
+        [
+            action("CreateEventSourceMapping"),
+            action("GetEventSourceMapping", esm),
+            action("DeleteEventSourceMapping", esm),
+            action("UpdateEventSourceMapping", esm),
+        ],
+        {esm: ["arn:${Partition}:lambda:${Region}:${Account}:event-source-mapping:${UUID}"]},
+    )
+    files["schemas/AWS_Lambda_EventSourceMapping.json"] = schema(
+        ["lambda:CreateEventSourceMapping", "lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping"],
+        ["lambda:DeleteEventSourceMapping"],
+    )
+    result = analyze(
+        template("AWS::Lambda::EventSourceMapping"),
+        backend(files),
+        account=ACCOUNT,
+        region="ap-south-1",
+        allow_delete=True,
+    )
+    assert statements(result)[0] == {
+        "Effect": "Allow",
+        "Action": [
+            "lambda:CreateEventSourceMapping",
+            "lambda:DeleteEventSourceMapping",
+            "lambda:GetEventSourceMapping",
+        ],
+        "Resource": "*",
+    }
+    assert statement_for(result, "lambda:UpdateEventSourceMapping")["Resource"] == (
+        f"arn:aws:lambda:ap-south-1:{ACCOUNT}:event-source-mapping:*"
+    )
+    assert result.scoping["unscoped"] == {
+        "authorized_on_star": ["lambda:DeleteEventSourceMapping", "lambda:GetEventSourceMapping"],
+        "no_resource_types": ["lambda:CreateEventSourceMapping"],
+    }
+    assert "authorized_on_star" in core.UNSCOPED_REASONS
+
+
+def test_actions_on_star_are_documented():
+    for action_name, reason in core.ACTIONS_ON_STAR.items():
+        assert action_name == action_name.lower() and action_name.count(":") == 1
+        assert "*" in reason and len(reason) > 40
+
+
+# --- Transforms ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "region, partition, expected",
+    [
+        ("ap-south-1", "aws", "arn:aws:cloudformation:ap-south-1:aws:transform/Serverless-2016-10-31"),
+        (None, "aws", "arn:aws:cloudformation:*:aws:transform/Serverless-2016-10-31"),
+        ("cn-north-1", "aws-cn", "arn:aws-cn:cloudformation:cn-north-1:aws:transform/Serverless-2016-10-31"),
+    ],
+)
+def test_scoped_transform_keeps_the_aws_account(region, partition, expected):
+    text = json.dumps({"Transform": "AWS::Serverless-2016-10-31", "Resources": {"Q": {"Type": "AWS::SQS::Queue"}}})
+    result = analyze(text, account=ACCOUNT, region=region, partition=partition)
+    assert statement_for(result, "cloudformation:CreateChangeSet") == {
+        "Effect": "Allow",
+        "Action": ["cloudformation:CreateChangeSet"],
+        "Resource": expected,
+    }
+    assert result.transforms[0]["resources"] == [expected]
+    assert result.scoping["scoped_count"] == 2
+
+
+def test_scoped_macro_is_in_the_account():
+    text = json.dumps({"Transform": "MyMacro", "Resources": {"Q": {"Type": "AWS::SQS::Queue"}}})
+    result = analyze(text, account=ACCOUNT, region="us-east-1")
+    assert statement_for(result, "cloudformation:CreateChangeSet")["Resource"] == (
+        f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:transform/MyMacro"
+    )
 
 
 # --- Validating the scope ---------------------------------------------------------
@@ -441,7 +604,9 @@ def test_size_warning(kwargs):
     result = analyze(template("AWS::SQS::Queue"), backend(files), **kwargs)
     assert 6144 < result.policy_size <= 10240
     [warning] = [w for w in result.warnings if "characters" in w]
-    assert "6,144 for a customer managed policy" in warning and "10,240" not in warning
+    assert "over IAM's limit of 6,144 for a customer managed policy" in warning
+    assert "inline policy, which can hold up to 10,240" in warning and "split" in warning
+    assert core.size_warning(result.policy_size, inline=True) is None  # --create-role attaches it inline
     assert result.to_dict()["policy_size"] == result.policy_size
 
     files["schemas/AWS_SQS_Queue.json"]["handlers"]["create"]["permissions"] *= 2
@@ -449,7 +614,9 @@ def test_size_warning(kwargs):
         f"sqs:SomeRatherLongActionName{i:04}" for i in range(500)
     ]
     bigger = analyze(template("AWS::SQS::Queue"), backend(files), **kwargs)
-    assert any("10,240" in w for w in bigger.warnings)
+    [warning] = [w for w in bigger.warnings if "characters" in w]
+    assert "limits of 6,144 for a customer managed policy and 10,240 for all of a role's inline policies" in warning
+    assert core.size_warning(bigger.policy_size, inline=True) == warning
 
 
 def test_small_policy_has_no_size_warning():

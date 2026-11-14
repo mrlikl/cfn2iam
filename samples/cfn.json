@@ -5,15 +5,13 @@
     "MyS3Bucket": {
       "Type": "AWS::S3::Bucket",
       "Properties": {
-        "BucketName": "my-example-bucket-12345",
         "VersioningConfiguration": { "Status": "Enabled" }
       }
     },
     "MyLambdaFunction": {
       "Type": "AWS::Lambda::Function",
       "Properties": {
-        "FunctionName": "MyExampleFunction",
-        "Runtime": "python3.9",
+        "Runtime": "python3.13",
         "Handler": "index.handler",
         "Code": {
           "ZipFile": "def handler(event, context):\n    return {'statusCode': 200, 'body': 'Hello World'}"
@@ -42,7 +40,6 @@
     "MyDynamoDBTable": {
       "Type": "AWS::DynamoDB::Table",
       "Properties": {
-        "TableName": "MyExampleTable",
         "AttributeDefinitions": [
           { "AttributeName": "id", "AttributeType": "S" }
         ],

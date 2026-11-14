@@ -137,6 +137,7 @@ def test_create_role_uses_the_scoped_policy(tmp_path, fetched, monkeypatch):
         return f"arn:aws:iam::{ACCOUNT}:role/{role_name}"
 
     monkeypatch.setattr(cli, "create_iam_role", create_iam_role)
+    monkeypatch.setattr(cli, "aws_credentials_problem", lambda: None)
     result = run(tmp_path, "--account", ACCOUNT, "--region", "us-east-1", "-c", "-r", "deploy")
 
     assert result.exit_code == 0, result.output

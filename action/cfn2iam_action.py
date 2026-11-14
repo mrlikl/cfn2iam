@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from typing import Dict, List, Mapping, Optional, Tuple
 
-from cfn2iam import compare
+from cfn2iam import compare, core
 
 DOCS = "https://github.com/mrlikl/cfn2iam#use-it-in-ci"
 COMMENT_LIMIT = 65536  # characters GitHub allows in a comment body
@@ -278,6 +278,27 @@ def pull_request(env: Mapping[str, str]) -> Optional[Dict]:
 # --- The run ----------------------------------------------------------------
 
 
+def comment_marker(name: str) -> str:
+    """The hidden first line that identifies this check's comment, for any ``name``.
+
+    An HTML comment ends at ``-->`` or ``--!>``, so ``>`` is percent-encoded, along with ``<``,
+    ``&``, ``%`` (so encoded names stay distinct) and line breaks and other control characters.
+    Other names are kept as they are, so the markers of comments earlier versions wrote still match.
+    """
+    if not name:
+        return "<!-- cfn2iam-action -->"
+    safe = re.sub(r"[<>&%\x00-\x1f\x7f\u2028\u2029]", lambda m: "".join(f"%{b:02X}" for b in m.group().encode()), name)
+    return f"<!-- cfn2iam-action:{safe} -->"
+
+
+def _summary_url(env: Mapping[str, str]) -> str:
+    server, repo, run_id = (env.get(k, "") for k in ("GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"))
+    if not (server and repo and run_id):
+        return ""
+    attempt = env.get("GITHUB_RUN_ATTEMPT", "")
+    return f"{server}/{repo}/actions/runs/{run_id}" + (f"/attempts/{attempt}" if attempt else "")
+
+
 def _code_list(items: List[str]) -> str:
     return ", ".join(f"`{i}`" for i in items)
 
@@ -323,10 +344,12 @@ class Result:
 
 def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
     """Everything except posting the comment and writing to GitHub's files."""
+    # CFN2IAM_ACTION_COMMENT_LIMIT is for this repository's CI, to exercise shortening without a huge template.
+    comment_limit = min(COMMENT_LIMIT, int(env.get("CFN2IAM_ACTION_COMMENT_LIMIT") or COMMENT_LIMIT))
     pkg_version = _cfn2iam_version()
     inputs = Inputs.from_env(env)
-    title = "cfn2iam permission check" + (f": {inputs.name}" if inputs.name else "")
-    marker = f"<!-- cfn2iam-action:{inputs.name} -->" if inputs.name else "<!-- cfn2iam-action -->"
+    title = "cfn2iam permission check" + (f": {compare._md_escape(inputs.name)}" if inputs.name else "")
+    marker = comment_marker(inputs.name)
     footer = [f'<sub>cfn2iam {pkg_version} · <a href="{DOCS}">how this check works</a></sub>']
     notices: List[Tuple[str, str]] = []
     errors: List[str] = []
@@ -377,6 +400,13 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
         try:
             generated_data = [_read_json(g.output) for g in generations]
             gen = compare.load_generated([(g.template, d) for g, d in zip(generations, generated_data, strict=True)])
+            if len(generations) > 1:
+                # Each template's own size warning is in gen.warnings; the combined policy can be over
+                # the limits when none of them is.
+                combined_warning = core.size_warning(core.policy_size(compare.combined_policy(gen)))
+                if combined_warning:
+                    gen.warnings.append(f"All templates combined: {combined_warning}")
+                    notices.append(("warning", f"All templates combined: {combined_warning}"))
             base = None
             if baseline_status == "found":
                 base = compare.load_baseline([(b, _read_json(os.path.join(cwd, b))) for b in inputs.baseline])
@@ -430,17 +460,27 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
                 f"Later runs will report what changes.\n\n```bash\n{commands}\n```"
             )
         elif report.changed and hand_written:
+            what = (
+                "grant the actions listed above to the deploy role and to the baseline"
+                if report.added
+                else "nothing new needs granting; to drop what is no longer needed, remove it from the deploy role "
+                "and the baseline"
+            )
             notes.append(
                 "<details><summary>How to accept this change</summary>\n\n"
-                f"{_code_list(inputs.baseline)} looks hand-written ({hand_written}), so edit it: grant the actions "
-                "listed above to the deploy role and to the baseline in this pull request. Regenerating it with "
-                "cfn2iam would replace it with the generated policy below.\n\n</details>"
+                f"{_code_list(inputs.baseline)} looks hand-written ({hand_written}), so edit it: {what} in this "
+                "pull request. Regenerating it with cfn2iam would replace it with the generated policy.\n\n</details>"
             )
         elif report.changed:
+            first = (
+                "Grant the new actions to the deploy role, then regenerate the baseline"
+                if report.added
+                else "Nothing new needs granting. To record the change, regenerate the baseline (and remove the "
+                "actions no longer needed from the deploy role, if you like)"
+            )
             notes.append(
                 "<details><summary>How to accept this change</summary>\n\n"
-                "Grant the new actions to the deploy role, then regenerate the baseline and commit it in this "
-                f"pull request:\n\n```bash\n{commands}\n```\n\n</details>"
+                f"{first} and commit it in this pull request:\n\n```bash\n{commands}\n```\n\n</details>"
             )
     if errors:
         notes.insert(0, "> [!CAUTION]\n> **The check could not run.**\n\n" + "\n\n".join(f"- {e}" for e in errors))
@@ -452,45 +492,70 @@ def run(env: Mapping[str, str], cwd: str, workdir: str) -> Result:
                 f"<details><summary>The generated policy</summary>\n\n```json\n{f.read().rstrip()}\n```\n\n</details>"
             )
 
+    summary_url = _summary_url(env)
+    summary_link = f"[the job summary]({summary_url})" if summary_url else "the job summary"
     if report is None:
         body = "\n".join([marker, f"### {title}", "", *context, "", *notes, "", *footer]).rstrip() + "\n"
         comment_md = summary_md = body
     else:
-        comment_md = compare.render_markdown(
-            report, title=title, marker=marker, context=context, notes=notes, footer=footer, max_length=COMMENT_LIMIT
+        summary_md = compare.render_markdown(
+            report, title=title, context=context, notes=[*notes, policy_block] if policy_block else notes, footer=footer
         )
+        with_policy = None
         if policy_block:
             with_policy = compare.render_markdown(
                 report, title=title, marker=marker, context=context, notes=[*notes, policy_block], footer=footer
             )
-            if len(with_policy) <= COMMENT_LIMIT:
-                comment_md = with_policy
-        summary_md = compare.render_markdown(
-            report, title=title, context=context, notes=[*notes, policy_block], footer=footer
-        )
+        if with_policy is not None and len(with_policy) <= comment_limit:
+            comment_md = with_policy
+        else:
+            comment_notes = list(notes)
+            if policy_block:
+                comment_notes.append(
+                    f"The generated policy is left out of this comment for length: see {summary_link}."
+                )
+            comment_md = compare.render_markdown(
+                report,
+                title=title,
+                marker=marker,
+                context=context,
+                notes=comment_notes,
+                footer=footer,
+                max_length=comment_limit,
+                shortened_note=(
+                    "> [!NOTE]\n> This comment is shortened to fit GitHub's size limit: some details (such as the "
+                    f"resource types that need each action) are left out. The full report is in {summary_link}."
+                ),
+            )
 
     counts = report.counts() if report else {}
-    has_baseline = report is not None and report.has_baseline
-    drift = bool(report and report.drift)
+    # After update-baseline wrote the file, the baseline grants exactly what the templates need:
+    # the outputs describe that, and the report describes what the write changed.
+    has_baseline = report is not None and report.has_baseline and not wrote_baseline
+    drift = bool(report and report.drift) and not wrote_baseline
     outputs = {
         "policy-path": policy_path,
         "added-count": str(counts.get("added", 0) if has_baseline else 0),
         "removed-count": str(counts.get("removed", 0) if has_baseline else 0),
         "conditional-count": str(counts.get("conditional", 0) if has_baseline else 0),
         "drift": "true" if drift else "false",
-        "baseline-status": baseline_status,
+        "baseline-status": "found" if wrote_baseline else baseline_status,
+        "baseline-updated": "true" if wrote_baseline else "false",
         "error": "true" if errors else "false",
     }
     exit_code = 0
     if errors:
         exit_code = 1
-    elif drift and inputs.fail_on_drift and not wrote_baseline:
+    elif wrote_baseline:
+        changed_text = f" ({compare.headline(report)})" if report.has_baseline and report.changed else ""
+        notices.append(
+            ("notice", f"Wrote the generated policy to {baseline_path}; commit it to accept it.{changed_text}")
+        )
+    elif drift and inputs.fail_on_drift:
         exit_code = 1
         notices.append(("error", compare.headline(report)))
     elif drift:
         notices.append(("warning", compare.headline(report)))
-    elif wrote_baseline:
-        notices.append(("notice", f"Wrote the generated policy to {baseline_path}; commit it to accept it."))
     elif baseline_status == "missing":
         notices.append(("notice", f"Baseline {', '.join(inputs.baseline)} does not exist yet; see the job summary."))
     changed = bool(errors) or report is None or report.changed or baseline_status != "found"
@@ -554,12 +619,18 @@ def comment(env: Mapping[str, str], inputs_comment: str, token: str, result: Res
     except (urllib.error.URLError, OSError, ValueError) as e:
         reason = _http_reason(e)
         head = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
-        why = (
-            "This pull request comes from a fork, so its token is read-only."
-            if head and head != env.get("GITHUB_REPOSITORY")
-            else "Pull requests from forks and from Dependabot get a read-only token; otherwise, give the job "
-            "`pull-requests: write`."
-        )
+        status = e.code if isinstance(e, urllib.error.HTTPError) else None
+        if status == 401:
+            why = "GitHub rejected the token: check the `github-token` input (it is expired, revoked or not a token)."
+        elif status not in (403, 404):
+            why = "GitHub could not be reached or failed; a later run will update the comment."
+        elif head and head != env.get("GITHUB_REPOSITORY"):
+            why = "This pull request comes from a fork, so its token is read-only."
+        else:
+            why = (
+                "Pull requests from forks and from Dependabot get a read-only token; otherwise, give the job "
+                "`pull-requests: write`."
+            )
         message = f"Could not comment on the pull request ({reason}). {why} The report is in the job summary."
         annotate("notice", message, title="cfn2iam")
         return "false", "", f"> [!NOTE]\n> {message}"
@@ -567,6 +638,36 @@ def comment(env: Mapping[str, str], inputs_comment: str, token: str, result: Res
         print(f"Pull request comment: {url}")
         return "true", url, None
     return "false", "", None
+
+
+def _check_marker_reuse(env: Mapping[str, str], inputs: "Inputs", marker: str) -> None:
+    """Warn when an earlier step of this job wrote the comment this step is about to overwrite.
+
+    Steps of one job share RUNNER_TEMP, so each records its marker there. Other jobs can't be
+    seen: there, only distinct names keep the comments apart.
+    """
+    if inputs.comment == "never" or pull_request(env) is None or not env.get("RUNNER_TEMP"):
+        return
+    registry = os.path.join(env["RUNNER_TEMP"], "cfn2iam-action-comments.txt")
+    try:
+        with open(registry, encoding="utf-8") as f:
+            earlier = {line.rstrip("\n") for line in f}
+    except OSError:
+        earlier = set()
+    if marker in earlier:
+        which = f"`name: {inputs.name}`" if inputs.name else "no `name`"
+        annotate(
+            "warning",
+            f"An earlier cfn2iam step in this job wrote the same pull request comment ({which}); this step replaces "
+            "its report. Give each invocation its own `name` to keep separate comments.",
+            title="cfn2iam",
+        )
+        return
+    try:
+        with open(registry, "a", encoding="utf-8") as f:
+            f.write(marker + "\n")
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -584,6 +685,10 @@ def main() -> int:
     report_path = os.path.join(workdir, "report.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(result.markdown_summary)
+    # The comment as it would be posted, next to the report (this repository's CI reads it).
+    with open(os.path.join(workdir, "comment.md"), "w", encoding="utf-8") as f:
+        f.write(result.markdown_comment)
+    _check_marker_reuse(env, inputs, result.markdown_comment.split("\n", 1)[0])
     commented, url, comment_notice = comment(env, inputs.comment, inputs.token, result)
     summary = result.markdown_summary
     if comment_notice:

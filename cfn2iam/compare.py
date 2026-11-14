@@ -305,6 +305,9 @@ def load_generated(documents: Iterable[Tuple[str, Any]]) -> Generated:
             for rtype, entry in (data.get("by_type") or {}).items():
                 for action in (entry.get("allow") or []) + (entry.get("delete") or []):
                     gen.needed_by.setdefault(action, set()).add((label, rtype))
+            for transform in data.get("transforms") or []:  # cfn2iam 0.4.1 and later
+                for action in transform.get("actions") or []:
+                    gen.needed_by.setdefault(action, set()).add((label, f"Transform {transform.get('name')}"))
             gen.warnings.extend(f"{label}: {w}" for w in data.get("warnings") or [])
             if data.get("unresolved"):
                 gen.unresolved[label] = dict(data["unresolved"])
@@ -487,7 +490,8 @@ def compare(gen: Generated, baseline: Optional[Baseline], conditional: str = "mi
     for s in statements:
         if s.has_condition or s.actions is None:
             continue  # NotAction can't be listed; a conditional entry isn't a plain grant or deny
-        pool = needed if s.effect == "Allow" else denied
+        # A baseline Deny that matches a needed action still matters: it is reported as denying it.
+        pool = needed if s.effect == "Allow" else denied + needed
         for entry in s.actions:
             key = (s.effect, entry.lower())
             if key in seen:
@@ -653,18 +657,23 @@ def render_markdown(
     notes: Sequence[str] = (),
     footer: Sequence[str] = (),
     max_length: Optional[int] = None,
+    shortened_note: str = "",
 ) -> str:
     """A Markdown report for a pull request comment or a job summary.
 
     ``context`` lines go under the headline (what was checked), ``notes`` after the
     findings, ``footer`` at the end. With ``max_length``, lists are shortened until the
-    text fits (a GitHub comment holds 65,536 characters).
+    text fits (a GitHub comment holds 65,536 characters), and ``shortened_note`` (say,
+    where the full report is) is added when they had to be.
     """
-    for limit, detail in ((None, True), (None, False), (200, False), (50, False), (10, False), (0, False)):
-        text = _render_markdown(report, title, marker, context, notes, footer, limit, detail)
+    variants = ((None, True), (None, False), (200, False), (50, False), (10, False), (0, False))
+    for i, (limit, detail) in enumerate(variants):
+        extra = [shortened_note] if i and shortened_note else []
+        text = _render_markdown(report, title, marker, context, [*notes, *extra], footer, limit, detail)
         if max_length is None or len(text) <= max_length:
             return text
-    return text[: max_length - 40] + "\n\n...cut short for length.\n"
+    tail = "\n\n...cut short for length." + (f" {shortened_note}" if shortened_note else "") + "\n"
+    return text[: max_length - len(tail)] + tail
 
 
 def _render_markdown(report, title, marker, context, notes, footer, limit, detail) -> str:

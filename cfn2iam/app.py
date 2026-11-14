@@ -6,6 +6,7 @@ The logic itself lives in :mod:`cfn2iam.core`, which the web version also runs.
 
 import asyncio
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -146,11 +147,55 @@ def generate_random_hash():
     return uuid.uuid4().hex[:8]
 
 
+def aws_credentials_problem() -> Optional[str]:
+    """Why boto3 can't sign requests with the caller's AWS credentials, or None when it can.
+
+    Checked before anything is written, so --create-role fails before the policy file appears.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import BotoCoreError, MissingDependencyException
+    except ImportError:
+        return 'boto3 is required for IAM role creation. Install with: pip install "cfn2iam[iam]"'
+    try:
+        credentials = boto3.session.Session().get_credentials()
+    except MissingDependencyException:
+        return (
+            'your AWS credentials come from "aws login", which boto3 can read only with botocore[crt]. Install it '
+            'next to cfn2iam: pip install "cfn2iam[iam]" "botocore[crt]" (with uv: uv tool install "cfn2iam[iam]" '
+            '--with "botocore[crt]"), or use other credentials, such as AWS_PROFILE for an SSO or access key profile'
+        )
+    except BotoCoreError as e:
+        return f"could not load your AWS credentials: {e}"
+    if credentials is None:
+        return (
+            "no AWS credentials found (see https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html)"
+        )
+    return None
+
+
 def create_iam_role(policy_document, role_name, permissions_boundary=None):
+    """Create the role with the policy inline. Returns its ARN, or None after printing why not.
+
+    The size is checked before anything is created. If attaching the policy fails, the role
+    this call created is deleted again; a role that already existed is never touched, because
+    CreateRole fails for it first.
+    """
+    size = core.policy_size(policy_document)
+    if size > core.INLINE_POLICY_LIMIT:
+        print(
+            f"Error: the policy is {size:,} characters (not counting whitespace), over the {core.INLINE_POLICY_LIMIT:,} "
+            f"IAM allows inline on a role, so the role {role_name} was not created. Split its statements into several "
+            "customer managed policies and attach those instead.",
+            file=sys.stderr,
+        )
+        return None
     try:
         import boto3
     except ImportError:
-        print("Error: boto3 is required for IAM role creation. Install with: pip install boto3", file=sys.stderr)
+        print(
+            'Error: boto3 is required for IAM role creation. Install with: pip install "cfn2iam[iam]"', file=sys.stderr
+        )
         return None
     iam_client = boto3.client("iam")
     trust_policy = {
@@ -159,24 +204,40 @@ def create_iam_role(policy_document, role_name, permissions_boundary=None):
             {"Effect": "Allow", "Principal": {"Service": "cloudformation.amazonaws.com"}, "Action": "sts:AssumeRole"}
         ],
     }
+    params = {
+        "RoleName": role_name,
+        "AssumeRolePolicyDocument": json.dumps(trust_policy),
+        "Description": "Role generated using cfn2iam",
+    }
+    if permissions_boundary:
+        params["PermissionsBoundary"] = permissions_boundary
     try:
-        params = {
-            "RoleName": role_name,
-            "AssumeRolePolicyDocument": json.dumps(trust_policy),
-            "Description": "Role generated using cfn2iam",
-        }
-        if permissions_boundary:
-            params["PermissionsBoundary"] = permissions_boundary
         response = iam_client.create_role(**params)
-        role_arn = response["Role"]["Arn"]
-        policy_name = f"{role_name}-Policy"
-        iam_client.put_role_policy(
-            RoleName=role_name, PolicyName=policy_name, PolicyDocument=json.dumps(policy_document)
-        )
-        return role_arn
     except Exception as e:
         print(f"Error: failed to create IAM role {role_name}: {e}", file=sys.stderr)
         return None
+    role_arn = response["Role"]["Arn"]
+    try:
+        iam_client.put_role_policy(
+            RoleName=role_name, PolicyName=f"{role_name}-Policy", PolicyDocument=json.dumps(policy_document)
+        )
+    except Exception as e:
+        print(f"Error: failed to attach the policy to the new IAM role {role_name}: {e}", file=sys.stderr)
+        try:
+            iam_client.delete_role(RoleName=role_name)
+        except Exception as delete_error:
+            print(
+                f"Error: could not delete the role {role_name} that this run created ({delete_error}). "
+                "It has no policy; delete it yourself.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Deleted the role {role_name} that this run created, so no role without the policy is left.",
+                file=sys.stderr,
+            )
+        return None
+    return role_arn
 
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -236,10 +297,20 @@ def main(
     to_stdout = output == "-" or (output is None and output_format == OutputFormat.json)
     # Keep stdout for the document when it goes there, and always for --format json.
     messages = sys.stderr if to_stdout or output_format == OutputFormat.json else sys.stdout
+
+    def say(text: str, file=messages) -> None:
+        # Flushed, so stdout and stderr keep their order when both are piped to one place.
+        print(text, file=file, flush=True)
+
     try:
         if registry and not _has_boto3():
             print('Error: --registry needs boto3. Install with: pip install "cfn2iam[iam]"', file=sys.stderr)
             sys.exit(1)
+        if create_role:
+            problem = aws_credentials_problem()
+            if problem:
+                print(f"Error: --create-role can't run: {problem}. No policy was written.", file=sys.stderr)
+                sys.exit(1)
         account = (account or "").strip() or None
         try:
             # --region alone is for registry lookups, so only --partition needs --account here.
@@ -255,11 +326,14 @@ def main(
             print(f"Error: {e}", file=sys.stderr)
             print("No policy was written, because it couldn't be scoped as asked.", file=sys.stderr)
             sys.exit(1)
+        general_size_warning = core.size_warning(analysis.policy_size)
         for warning in analysis.warnings:
-            print(f"Warning: {warning}", file=sys.stderr)
+            if create_role and warning == general_size_warning:
+                continue  # --create-role attaches the policy inline, where other limits apply; checked below
+            say(f"Warning: {warning}", sys.stderr)
         resource_types = analysis.resource_types
         if not resource_types:
-            print("No resource types found in the template.", file=messages)
+            say("No resource types found in the template.")
             sys.exit(1)
         failures = analysis.failures
         skipped = {t: e for t, e in failures.items() if ignore_unknown and isinstance(e, UnknownResourceType)}
@@ -278,7 +352,7 @@ def main(
             print("No policy was written, because it would be missing permissions.", file=sys.stderr)
             sys.exit(1)
         if analysis.scoping is not None:
-            print(scoping_summary(analysis.scoping), file=sys.stderr)
+            say(scoping_summary(analysis.scoping), sys.stderr)
         policy_document = analysis.policy
         if output_format == OutputFormat.json:
             document = {"template": template_path, "allow_delete": allow_delete, **analysis.to_dict()}
@@ -287,19 +361,23 @@ def main(
         if to_stdout:
             json.dump(document, sys.stdout, indent=2)
             sys.stdout.write("\n")
+            sys.stdout.flush()
         else:
             file_path = output or f"policy-{generate_random_hash()}.json"
+            parent = os.path.dirname(file_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(file_path, "w") as f:
                 json.dump(document, f, indent=2)
-            print(f"Generated IAM Policy Document to {file_path}", file=messages)
+            say(f"Generated IAM Policy Document to {file_path}")
         if create_role:
             role_name = role_name or f"cfn2iam-{generate_random_hash()}"
             role_arn = create_iam_role(policy_document, role_name, permissions_boundary)
             if not role_arn:
                 sys.exit(1)
-            print(f"Successfully created IAM role: {role_arn}", file=messages)
+            say(f"Successfully created IAM role: {role_arn}")
     except Exception as e:
-        print(f"Error: {e}", file=messages)
+        say(f"Error: {e}")
         sys.exit(1)
 
 

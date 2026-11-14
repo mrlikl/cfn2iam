@@ -81,8 +81,11 @@ assert not analysis.failures, analysis.unresolved
 assert analysis.resource_types == ["AWS::IAM::Role", "AWS::Lambda::Function", "AWS::S3::Bucket"], analysis.resource_types
 assert analysis.policy["Statement"] == [
     {"Effect": "Allow", "Action": ["iam:CreateRole", "lambda:CreateFunction", "s3:CreateBucket"], "Resource": "*"},
+    # CloudFormation runs the SAM transform as the deploy role.
+    {"Effect": "Allow", "Action": ["cloudformation:CreateChangeSet"], "Resource": "arn:*:cloudformation:*:aws:transform/Serverless-2016-10-31"},
     {"Effect": "Deny", "Action": ["s3:DeleteBucket"], "Resource": "*"},
 ], analysis.policy
+assert [t["name"] for t in analysis.to_dict()["transforms"]] == ["AWS::Serverless-2016-10-31"], analysis.transforms
 json.dumps(analysis.to_dict())
 
 lookup = await core.analyze_resource_type("AWS::Serverless::Function", fetch_json)
@@ -109,12 +112,13 @@ BACKEND.update({
 })
 scoped = await core.analyze_template(TEMPLATE, fetch_json, account="123456789012", region="eu-west-1")
 assert scoped.policy["Statement"] == [
+    {"Effect": "Allow", "Action": ["cloudformation:CreateChangeSet"], "Resource": "arn:aws:cloudformation:eu-west-1:aws:transform/Serverless-2016-10-31"},
     {"Effect": "Allow", "Action": ["iam:CreateRole"], "Resource": "arn:aws:iam::123456789012:role/*"},
     {"Effect": "Allow", "Action": ["lambda:CreateFunction"], "Resource": "arn:aws:lambda:eu-west-1:123456789012:function:*"},
     {"Effect": "Allow", "Action": ["s3:CreateBucket"], "Resource": "arn:aws:s3:::*"},
     {"Effect": "Deny", "Action": ["s3:DeleteBucket"], "Resource": "*"},
 ], scoped.policy
-assert scoped.to_dict()["scoping"]["scoped_count"] == 3, scoped.scoping
+assert scoped.to_dict()["scoping"]["scoped_count"] == 4, scoped.scoping
 json.dumps(scoped.to_dict())
 
 cli_only = sorted(m for m in ("typer", "click", "boto3", "cfn2iam.app") if m in sys.modules)

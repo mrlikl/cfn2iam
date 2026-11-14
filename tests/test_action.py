@@ -16,6 +16,16 @@ spec.loader.exec_module(action)
 POLICIES = {
     "a.yaml": {"allow": ["s3:CreateBucket", "s3:GetBucketTagging"], "delete": ["s3:DeleteBucket"]},
     "b.yaml": {"allow": ["sqs:CreateQueue"], "delete": ["sqs:DeleteQueue"]},
+    "custom.yaml": {
+        "allow": ["sqs:CreateQueue"],
+        "delete": ["sqs:DeleteQueue"],
+        "warnings": [
+            "Skipped 1 custom resource: Thing (Custom::Thing). cfn2iam can't tell what a custom resource needs"
+        ],
+    },
+    # Over the inline limit only when combined with big2.yaml.
+    "big1.yaml": {"allow": [f"svc:LongActionNameNumber{i:04}" for i in range(0, 260)], "delete": []},
+    "big2.yaml": {"allow": [f"svc:LongActionNameNumber{i:04}" for i in range(260, 520)], "delete": []},
 }
 
 
@@ -41,8 +51,10 @@ def fake_generate(template, out_path, options, cwd):
         "delete": p["delete"],
         "by_type": {"AWS::S3::Bucket": {"allow": p["allow"], "delete": p["delete"]}},
         "unresolved": {},
-        "warnings": [],
+        "warnings": list(p.get("warnings", [])),
     }
+    if not p["delete"]:
+        data["policy"]["Statement"].pop()
     log = "Warning: something to know" if name == "b.yaml" else ""
     if "--account" in options:
         account = options[options.index("--account") + 1]
@@ -57,7 +69,7 @@ def fake_generate(template, out_path, options, cwd):
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     monkeypatch.setattr(action, "generate", fake_generate)
-    for name in ("a.yaml", "b.yaml", "broken.yaml"):
+    for name in ("a.yaml", "b.yaml", "broken.yaml", "custom.yaml", "big1.yaml", "big2.yaml"):
         (tmp_path / "stacks").mkdir(exist_ok=True)
         (tmp_path / "stacks" / name).write_text("Resources: {}")
     (tmp_path / "work").mkdir()
@@ -206,6 +218,24 @@ def test_update_baseline_writes_the_policy(repo):
     assert again.exit_code == 0 and not again.changed
 
 
+def test_update_baseline_reports_the_new_state_in_its_outputs(repo):
+    path = baseline(repo, ["s3:CreateBucket", "kms:Decrypt"])
+    result = run(repo, baseline=path, update_baseline="true")
+    assert result.exit_code == 0
+    # The baseline now grants exactly what the templates need: no drift is left to report.
+    assert result.outputs["drift"] == "false"
+    assert result.outputs["added-count"] == "0" and result.outputs["removed-count"] == "0"
+    assert result.outputs["baseline-updated"] == "true" and result.outputs["baseline-status"] == "found"
+    [(level, message)] = result.notices
+    assert level == "notice" and message.startswith("Wrote the generated policy to iam/baseline.json")
+    assert "Permission drift" in message  # what the write accepted
+    assert run(repo, baseline=path).outputs["drift"] == "false"
+
+
+def test_baseline_updated_is_false_otherwise(repo):
+    assert run(repo).outputs["baseline-updated"] == "false"
+
+
 def test_update_baseline_needs_one_file(repo):
     assert run(repo, update_baseline="true").exit_code == 1
 
@@ -290,6 +320,14 @@ def test_on_change_skips_a_new_comment_when_nothing_changed(tmp_path, monkeypatc
     assert [m for m, _ in api.calls] == ["GET"]
 
 
+def test_a_rejected_token_is_not_blamed_on_forks(tmp_path, monkeypatch):
+    patch_api(monkeypatch, FakeAPI(fail=401))
+    commented, url, notice = action.comment(pr_env(tmp_path, head_repo="fork/r"), "always", "t", result())
+    assert commented == "false"
+    assert "GitHub rejected the token: check the `github-token` input" in notice
+    assert "fork" not in notice and "Dependabot" not in notice
+
+
 @pytest.mark.parametrize("head_repo, why", [("fork/r", "comes from a fork"), ("o/r", "Dependabot")])
 def test_read_only_token_degrades_to_the_summary(tmp_path, monkeypatch, capsys, head_repo, why):
     patch_api(monkeypatch, FakeAPI(fail=403))
@@ -339,6 +377,94 @@ def test_scoped_run(repo, capsys):
     assert "stacks/a.yaml: Scoped 2 of 3 actions" in capsys.readouterr().out
     assert "cfn2iam stacks/a.yaml --region eu-west-1 --account 123456789012 -o iam/other.json" in (
         run(repo, account="123456789012", region="eu-west-1", baseline="iam/other.json").markdown_comment
+    )
+
+
+def test_only_removals_do_not_ask_to_grant_anything(repo):
+    result = run(repo, baseline=baseline(repo, ["s3:CreateBucket", "s3:GetBucketTagging", "kms:Decrypt"]))
+    assert result.exit_code == 0 and result.outputs["removed-count"] == "1"
+    assert "How to accept this change" in result.markdown_comment
+    assert "Grant the new actions" not in result.markdown_comment
+    assert "Nothing new needs granting" in result.markdown_comment
+    hand = baseline(repo, ["s3:CreateBucket", "s3:GetBucketTagging", "kms:*"])
+    text = run(repo, baseline=hand).markdown_comment
+    assert "looks hand-written" in text and "nothing new needs granting" in text and "grant the actions" not in text
+
+
+def test_custom_resources_are_in_the_comment(repo):
+    result = run(
+        repo, templates="stacks/custom.yaml", baseline=baseline(repo, ["sqs:CreateQueue"], ["sqs:DeleteQueue"])
+    )
+    assert "#### Warnings" in result.markdown_comment
+    assert "Skipped 1 custom resource: Thing (Custom::Thing)" in result.markdown_comment
+    assert "Skipped 1 custom resource" in result.markdown_summary
+
+
+def test_combined_policy_over_the_size_limits_is_in_the_comment(repo):
+    result = run(repo, templates="stacks/big1.yaml\nstacks/big2.yaml")
+    assert "All templates combined: The policy is" in result.markdown_comment
+    assert ("warning", next(m for _, m in result.notices if m.startswith("All templates combined"))) in result.notices
+    assert "All templates combined" not in run(repo, templates="stacks/big1.yaml").markdown_comment
+
+
+def test_a_shortened_comment_says_so_and_points_to_the_summary(repo, monkeypatch):
+    monkeypatch.setattr(action, "COMMENT_LIMIT", 3000)
+    env_ = env(templates="stacks/big1.yaml", baseline=baseline(repo, ["s3:*"]))
+    env_.update({"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": "o/r", "GITHUB_RUN_ID": "42"})
+    result = action.run(env_, str(repo), str(repo / "work"))
+    assert len(result.markdown_comment) <= 3000
+    assert "This comment is shortened to fit GitHub's size limit" in result.markdown_comment
+    assert "The generated policy is left out of this comment for length" in result.markdown_comment
+    assert "(https://github.com/o/r/actions/runs/42)" in result.markdown_comment
+    assert "shortened" not in result.markdown_summary and "```json" in result.markdown_summary
+
+
+@pytest.mark.parametrize(
+    "name, marker",
+    [
+        ("", "<!-- cfn2iam-action -->"),
+        ("network", "<!-- cfn2iam-action:network -->"),
+        ("self-test (expected drift)", "<!-- cfn2iam-action:self-test (expected drift) -->"),  # as 0.4.0 wrote it
+        ("a --> <b>", "<!-- cfn2iam-action:a --%3E %3Cb%3E -->"),
+        ("x--!>y", "<!-- cfn2iam-action:x--!%3Ey -->"),
+        ("50%\nnext", "<!-- cfn2iam-action:50%25%0Anext -->"),
+    ],
+)
+def test_comment_marker_survives_any_name(name, marker):
+    assert action.comment_marker(name) == marker
+    assert marker.count("-->") == 1 and marker.endswith(" -->") and "\n" not in marker
+
+
+def test_names_with_markup_get_their_own_comment(repo, tmp_path, monkeypatch):
+    result_ = run(repo, name="prod --> <b>")
+    marker = result_.markdown_comment.split("\n", 1)[0]
+    assert marker == "<!-- cfn2iam-action:prod --%3E %3Cb%3E -->"
+    api = FakeAPI([{"id": 3, "body": "<!-- cfn2iam-action:prod -->\n..."}, {"id": 4, "body": marker + "\nold"}])
+    patch_api(monkeypatch, api)
+    action.comment(pr_env(tmp_path), "always", "t", result_)
+    assert api.calls[-1] == ("PATCH", "/repos/o/r/issues/comments/4")
+
+
+def test_a_second_step_with_the_same_comment_warns(tmp_path, capsys):
+    env_ = {**pr_env(tmp_path), "RUNNER_TEMP": str(tmp_path)}
+    inputs = action.Inputs.from_env({"INPUT_TEMPLATES": "x"})
+    action._check_marker_reuse(env_, inputs, "<!-- cfn2iam-action -->")
+    assert capsys.readouterr().out == ""
+    action._check_marker_reuse(env_, inputs, "<!-- cfn2iam-action:other -->")
+    action._check_marker_reuse(env_, inputs, "<!-- cfn2iam-action -->")
+    out = capsys.readouterr().out
+    assert out.startswith("::warning title=cfn2iam::An earlier cfn2iam step in this job wrote the same")
+    assert "no `name`" in out
+
+
+def test_accept_commands_pin_a_release_and_create_directories(repo):
+    inputs = action.Inputs.from_env({"INPUT_TEMPLATES": "x"})
+    assert action.accept_commands(inputs, ["t.yaml"], "iam/p.json", "0.4.1").splitlines() == [
+        'pip install "cfn2iam==0.4.1"',
+        "cfn2iam t.yaml -o iam/p.json",
+    ]
+    assert action.accept_commands(inputs, ["t.yaml"], "p.json", "0.4.2.dev3+gabc").splitlines()[0] == (
+        "pip install cfn2iam"
     )
 
 

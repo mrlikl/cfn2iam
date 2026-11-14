@@ -7,6 +7,7 @@ group, keeps ``cfn2iam template.yaml`` and its help exactly as they were.
 """
 
 import json
+import os
 import sys
 from enum import StrEnum
 from typing import List, Optional
@@ -49,7 +50,11 @@ def _read_json(path: str):
 def _write(path: Optional[str], text: str) -> None:
     if path in (None, "-"):
         sys.stdout.write(text)
+        sys.stdout.flush()
     else:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
 

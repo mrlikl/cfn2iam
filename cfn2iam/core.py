@@ -30,6 +30,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, U
 import yaml
 
 __all__ = [
+    "ACTIONS_ON_STAR",
     "Analysis",
     "NotFound",
     "PARTITIONS",
@@ -49,6 +50,8 @@ __all__ = [
     "parse_template",
     "permissions_from_schema",
     "policy_size",
+    "size_warning",
+    "transform_arn",
 ]
 
 JsonFetcher = Callable[[str], Union[Any, Awaitable[Any]]]
@@ -59,7 +62,10 @@ IGNORED_TYPE_PATTERNS = (
     r"^AWS::CDK::Metadata",
     r"^AWS::CloudFormation::CustomResource",
 )
+# Of the ignored types, the ones that do need permissions cfn2iam can't know: they are reported.
+CUSTOM_RESOURCE_PATTERN = r"^(Custom::.*|AWS::CloudFormation::CustomResource)$"
 SAM_PREFIX = "AWS::Serverless::"
+SAM_TRANSFORM = "AWS::Serverless-2016-10-31"
 
 
 class SchemaError(Exception):
@@ -89,6 +95,10 @@ class ServiceReferenceError(Exception):
 # --- Template parsing -------------------------------------------------------
 
 
+class _ShortFormTransform(dict):
+    """The mapping of a ``!Transform`` short-form tag: a plain dict, marked so transforms can be found."""
+
+
 def _construct_tagged(loader, tag_suffix, node):
     # Short-form intrinsics (!Ref, !GetAtt, ...) are read as their plain value.
     if isinstance(node, yaml.ScalarNode):
@@ -96,7 +106,8 @@ def _construct_tagged(loader, tag_suffix, node):
     if isinstance(node, yaml.SequenceNode):
         return loader.construct_sequence(node)
     if isinstance(node, yaml.MappingNode):
-        return loader.construct_mapping(node)
+        mapping = loader.construct_mapping(node)
+        return _ShortFormTransform(mapping) if tag_suffix == "Transform" else mapping
     return None
 
 
@@ -132,26 +143,85 @@ def parse_template(text: str, template_format: Optional[str] = None) -> Any:
             ) from yaml_error
 
 
-def _template_resources(template: Any) -> List[Tuple[str, str, Dict]]:
-    """(logical id, type, properties) for every resource that needs permissions."""
+def _template_resources(template: Any) -> Tuple[List[Tuple[str, str, Dict]], List[Dict[str, str]]]:
+    """(logical id, type, properties) for every resource that needs permissions, and the custom resources skipped.
+
+    Resources inside ``Fn::ForEach`` loops (the ``AWS::LanguageExtensions`` transform) count
+    too: their types are what the loop creates, whatever the loop's collection holds.
+    """
     if template is None:
-        return []
+        return [], []
     if not isinstance(template, dict):
         raise TemplateError("the template is not a mapping")
     resources = template.get("Resources")
     if resources is None:
-        return []
+        return [], []
     if not isinstance(resources, dict):
         raise TemplateError("the template's Resources section is not a mapping")
     found = []
-    for logical_id, res in resources.items():
-        if not isinstance(res, dict):
-            continue
-        rtype = res.get("Type")
-        if not isinstance(rtype, str) or any(re.match(p, rtype) for p in IGNORED_TYPE_PATTERNS):
-            continue
-        found.append((str(logical_id), rtype, res.get("Properties", {}) or {}))
-    return found
+    skipped = []
+
+    def collect(section: Dict) -> None:
+        for logical_id, res in section.items():
+            # Fn::ForEach::Name: [identifier, collection, {templated logical id: resource}]
+            if isinstance(logical_id, str) and logical_id.startswith("Fn::ForEach::"):
+                if isinstance(res, list) and len(res) == 3 and isinstance(res[2], dict):
+                    collect(res[2])
+                continue
+            if not isinstance(res, dict):
+                continue
+            rtype = res.get("Type")
+            if not isinstance(rtype, str):
+                continue
+            if any(re.match(p, rtype) for p in IGNORED_TYPE_PATTERNS):
+                if re.match(CUSTOM_RESOURCE_PATTERN, rtype):
+                    skipped.append({"logical_id": str(logical_id), "type": rtype})
+                continue
+            found.append((str(logical_id), rtype, res.get("Properties", {}) or {}))
+
+    collect(resources)
+    return found, skipped
+
+
+def _template_transforms(template: Any) -> List[Dict[str, Any]]:
+    """Every transform the template uses: the top-level ``Transform`` (a name, a list of names, or
+    ``{Name, Parameters}`` mappings) and ``Fn::Transform`` (or ``!Transform``) anywhere in it.
+
+    Each is ``{"name": ..., "locations": [...]}``; ``locations`` are the literal
+    ``Parameters.Location`` values of ``AWS::Include``.
+    """
+    if not isinstance(template, dict):
+        return []
+    found: Dict[str, List[str]] = {}
+
+    def add(item: Any) -> None:
+        name = item.get("Name") if isinstance(item, dict) else item
+        if not isinstance(name, str) or not name.strip():
+            return  # a parameter or a function: CloudFormation requires a literal name, so nothing to grant
+        locations = found.setdefault(name.strip(), [])
+        params = item.get("Parameters") if isinstance(item, dict) else None
+        location = params.get("Location") if isinstance(params, dict) else None
+        if isinstance(location, str) and location not in locations:
+            locations.append(location)
+
+    top = template.get("Transform")
+    for item in top if isinstance(top, list) else [top]:
+        add(item)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, _ShortFormTransform):
+            add(node)
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "Fn::Transform":
+                    add(value)
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk({k: v for k, v in template.items() if k != "Transform"})
+    return [{"name": name, "locations": locations} for name, locations in found.items()]
 
 
 # --- SAM expansion ----------------------------------------------------------
@@ -281,6 +351,8 @@ def generate_policy_document(all_update_permissions, all_delete_permissions, all
 
 # IAM's size limits, which count every character except whitespace.
 POLICY_SIZE_LIMITS = (("customer managed policy", 6144), ("role's inline policies", 10240))
+MANAGED_POLICY_LIMIT = 6144  # one customer managed policy
+INLINE_POLICY_LIMIT = 10240  # all of one role's inline policies together
 
 
 def policy_size(policy: Dict) -> int:
@@ -288,16 +360,31 @@ def policy_size(policy: Dict) -> int:
     return len(re.sub(r"\s", "", json.dumps(policy, separators=(",", ":"))))
 
 
+def size_warning(size: int, inline: bool = False) -> Optional[str]:
+    """What a policy of ``size`` characters means for IAM's limits, or None when it fits.
+
+    ``inline`` is for a caller that attaches the policy inline to a new role (``--create-role``),
+    where only the inline limit applies.
+    """
+    head = f"The policy is {size:,} characters (not counting whitespace)"
+    if size > INLINE_POLICY_LIMIT:
+        return (
+            f"{head}, over IAM's limits of {MANAGED_POLICY_LIMIT:,} for a customer managed policy and "
+            f"{INLINE_POLICY_LIMIT:,} for all of a role's inline policies together. Split its statements "
+            "into several customer managed policies to use it."
+        )
+    if size > MANAGED_POLICY_LIMIT and not inline:
+        return (
+            f"{head}, over IAM's limit of {MANAGED_POLICY_LIMIT:,} for a customer managed policy. Attach it to the "
+            f"role as an inline policy, which can hold up to {INLINE_POLICY_LIMIT:,} (all of a role's inline "
+            "policies together), or split its statements into several customer managed policies."
+        )
+    return None
+
+
 def _size_warnings(policy: Dict) -> List[str]:
-    size = policy_size(policy)
-    over = [f"{limit:,} for a {name}" for name, limit in POLICY_SIZE_LIMITS if size > limit]
-    if not over:
-        return []
-    return [
-        f"The policy is {size:,} characters (not counting whitespace), over IAM's limit of "
-        + " and ".join(over)
-        + ". Split its statements into several managed policies to use it."
-    ]
+    warning = size_warning(policy_size(policy))
+    return [warning] if warning else []
 
 
 # --- Resource scoping -------------------------------------------------------
@@ -330,6 +417,7 @@ WILDCARD = "wildcard"  # s3:*, ec2:Describe*
 INVALID_ACTION = "invalid_action"  # not service:action
 UNSCOPABLE_ARN = "unscopable_arn"  # an ARN format that can't be filled with confidence
 DENY = "deny"  # delete-only actions, denied on every resource on purpose
+AUTHORIZED_ON_STAR = "authorized_on_star"  # in ACTIONS_ON_STAR: the service checks some calls against "*"
 
 # Each reason in words that read after a count ("3 with no resource-level permissions").
 UNSCOPED_REASONS = {
@@ -340,6 +428,25 @@ UNSCOPED_REASONS = {
     INVALID_ACTION: "not of the form service:action",
     UNSCOPABLE_ARN: "with an ARN format that can't be filled in",
     DENY: "delete-only, denied on every resource",
+    AUTHORIZED_ON_STAR: 'that AWS authorizes on "*" in some calls',
+}
+
+# Actions that stay on "Resource": "*" although the Service Authorization Reference lists
+# resource types for them, because the service authorizes some of their calls against "*",
+# so a statement on the listed ARNs is denied. Lowercase service:action -> the reason and the
+# evidence. Add an entry only with evidence of such a denial, never to be safe.
+ACTIONS_ON_STAR = {
+    "lambda:geteventsourcemapping": (
+        "Once an event source mapping is gone, Lambda authorizes GetEventSourceMapping for its UUID against "
+        '"*". The AWS::Lambda::EventSourceMapping delete handler calls it until the mapping is gone, so a '
+        'policy scoped to event-source-mapping ARNs fails the delete: "not authorized to perform: '
+        'lambda:GetEventSourceMapping on resource: *" (seen in a real account, on a plain template and on a '
+        'SAM SQS event; with the action on "*", create and delete succeeded).'
+    ),
+    "lambda:deleteeventsourcemapping": (
+        "Likewise for DeleteEventSourceMapping on a mapping that no longer exists: retrying the failed delete "
+        'above failed with "not authorized to perform: lambda:DeleteEventSourceMapping on resource: *".'
+    ),
 }
 
 # Prefixes that appear in AWS's schemas but are not IAM service prefixes. They are
@@ -368,7 +475,8 @@ _CROSS_ACCOUNT_TYPES = {
 }
 
 # An action whose resources include more than this many ARNs of one service, region and
-# account gets arn:<partition>:<service>:<region>:<account>:* for them instead.
+# account gets arn:<partition>:<service>:<region>:<account>:* for them instead, where that
+# pattern is valid (see _ServiceReference.collapsible).
 COLLAPSE_AT = 4
 
 _PLACEHOLDER = re.compile(r"\$\{([^}]*)\}")
@@ -445,6 +553,28 @@ def fill_arn(arn_format: str, scope: Scope, any_region: bool = False, any_accoun
     return re.sub(r"\*{2,}", "*", arn)
 
 
+TRANSFORM_ACTION = "cloudformation:CreateChangeSet"
+
+
+def transform_arn(name: str, scope: Optional[Scope] = None) -> str:
+    """The resource CloudFormation authorizes ``cloudformation:CreateChangeSet`` on to run a transform.
+
+    When a stack is deployed with a service role, CloudFormation processes each transform as that
+    role, and checks this permission first. AWS's transforms (``AWS::Serverless-2016-10-31``,
+    ``AWS::LanguageExtensions``, ``AWS::Include``, ...) live in the account ``aws``:
+    ``arn:aws:cloudformation:us-east-1:aws:transform/Serverless-2016-10-31``. A macro lives in the
+    account that defines it: ``arn:aws:cloudformation:us-east-1:123456789012:transform/MyMacro``.
+    Without a scope the partition, region and (for a macro) account are ``*``.
+    """
+    if name.startswith("AWS::"):
+        account, suffix = "aws", name[len("AWS::") :]
+    else:
+        account, suffix = (scope.account if scope else "*"), name
+    partition = scope.partition if scope else "*"
+    region = scope.region if scope and scope.region else "*"
+    return f"arn:{partition}:cloudformation:{region}:{account}:transform/{suffix}"
+
+
 def _covers(a: str, b: str) -> bool:
     """True if ARN pattern ``a`` matches everything ``b`` does (conservatively: False if unsure).
 
@@ -467,18 +597,19 @@ def _covers(a: str, b: str) -> bool:
     return ra.endswith("*") and "*" not in stem and "?" not in stem and rb.startswith(stem)
 
 
-def _reduce_arns(arns: Set[str]) -> List[str]:
+def _reduce_arns(arns: Set[str], collapsible: Callable[[str], bool]) -> List[str]:
     """Collapse long runs within one service, then drop ARNs another one covers.
 
     Both steps only ever widen: arn:<partition>:<service>:<region>:<account>:* replaces
-    more than COLLAPSE_AT ARNs that share those segments.
+    more than COLLAPSE_AT ARNs that share those segments, when ``collapsible(base)`` says
+    that pattern is valid for the service.
     """
     by_base: Dict[str, Set[str]] = {}
     for arn in arns:
         by_base.setdefault(":".join(arn.split(":", 5)[:5]), set()).add(arn)
     out: Set[str] = set()
     for base, group in by_base.items():
-        out.update({base + ":*"} if len(group) > COLLAPSE_AT else group)
+        out.update({base + ":*"} if len(group) > COLLAPSE_AT and collapsible(base) else group)
     kept = []
     for arn in sorted(out):
         # Of two patterns that cover each other (they are then equal), the sort keeps the first.
@@ -506,6 +637,7 @@ class _ServiceReference:
         self.fetch_json = fetch_json
         self.index: Dict[str, str] = {}  # prefix -> filename
         self.services: Dict[str, Dict] = {}
+        self._collapsible: Dict[str, bool] = {}
 
     async def _get(self, path: str) -> Any:
         try:
@@ -535,6 +667,31 @@ class _ServiceReference:
                 raise ServiceReferenceError(f"servicereference/{self.index[prefix]} is malformed")
             self.services[prefix] = data
 
+    def collapsible(self, base: str) -> bool:
+        """Whether ``base + ":*"`` (base is arn:<partition>:<service>:<region>:<account>) may stand for
+        that service's ARNs in the region and account.
+
+        A resource part with no resource-type prefix means the service's prefix-less resource type,
+        if it has one, and that type's own ARN format then rules. S3's is the bucket,
+        ``arn:${Partition}:s3:::${BucketName}``, so IAM rejects ``arn:aws:s3:us-east-1:123456789012:*``
+        ("can not contain region information"), and likewise any other service whose prefix-less
+        type leaves the region or account empty. Every collapsed pattern the published reference can
+        produce was put to IAM (PutRolePolicy): it rejected exactly the S3 ones. A service whose own
+        reference isn't loaded is not collapsed, since its formats can't be checked.
+        """
+        if base not in self._collapsible:
+            _, _, service, region, account = base.split(":", 4)
+            data = self.services.get(service)
+            ok = data is not None
+            for entry in ((data or {}).get("resources") or {}).values():
+                for arn_format in (entry or {}).get("arnFormats") or []:
+                    parts = arn_format.split(":", 5) if isinstance(arn_format, str) else []
+                    if len(parts) == 6 and parts[2] == service and _PLACEHOLDER.fullmatch(parts[5]):
+                        if (region and not parts[3]) or (account and not parts[4]):
+                            ok = False
+            self._collapsible[base] = ok
+        return self._collapsible[base]
+
     def resources(self, action: str, scope: Scope, any_region: bool, any_account: bool) -> Tuple[Any, ...]:
         """(ARNs, widened, None) for an action that can be scoped, or (None, False, the reason it stays on "*").
 
@@ -545,6 +702,8 @@ class _ServiceReference:
         if parsed is None:
             return None, False, reason
         prefix, name = parsed
+        if f"{prefix}:{name}" in ACTIONS_ON_STAR:
+            return None, False, AUTHORIZED_ON_STAR
         service = self.services.get(prefix)
         if service is None:
             return None, False, UNKNOWN_SERVICE
@@ -567,7 +726,7 @@ class _ServiceReference:
                 if arn is None:
                     return None, False, UNSCOPABLE_ARN
                 arns.add(arn)
-        return _reduce_arns(arns), widened, None
+        return _reduce_arns(arns, self.collapsible), widened, None
 
 
 def _scoped_policy(
@@ -577,6 +736,7 @@ def _scoped_policy(
     scope: Scope,
     reference: _ServiceReference,
     by_type: Dict[str, Dict[str, List[str]]],
+    fixed: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[Dict, Dict, List[str]]:
     """(policy, the scoping report, warnings).
 
@@ -585,7 +745,8 @@ def _scoped_policy(
     service's ARN patterns together grants nothing outside the account and region. Actions
     with a deliberately widened segment are grouped only with actions that have exactly
     the same resources, so the widening never spreads. The Deny on delete-only actions
-    stays on "*": a Deny limited to some ARNs would deny less.
+    stays on "*": a Deny limited to some ARNs would deny less. ``fixed`` maps actions the
+    template needs on known ARNs (a transform) to those ARNs; they get their own statement.
     """
     cross_region: Set[str] = set()
     cross_account: Set[str] = set()
@@ -615,18 +776,22 @@ def _scoped_policy(
         group = groups.setdefault(key, (set(), []))
         group[0].update(arns)
         group[1].append(action)
+    for action, arns in sorted((fixed or {}).items()):
+        group = groups.setdefault(("exact", *sorted(arns)), (set(), []))
+        group[0].update(arns)
+        group[1].append(action)
 
     # Groups that end up with the same resources share a statement.
     merged: Dict[Tuple[str, ...], List[str]] = {}
     for arns, actions in groups.values():
-        merged.setdefault(tuple(_reduce_arns(arns)), []).extend(actions)
+        merged.setdefault(tuple(_reduce_arns(arns, reference.collapsible)), []).extend(actions)
 
     statements = []
     if on_star:
         statements.append({"Effect": "Allow", "Action": on_star, "Resource": "*"})
-    for arns, actions in sorted(merged.items(), key=lambda g: min(g[1])):
+    for arns, actions in sorted(merged.items(), key=lambda g: (min(g[1]), g[0])):
         resource = arns[0] if len(arns) == 1 else list(arns)
-        statements.append({"Effect": "Allow", "Action": sorted(actions), "Resource": resource})
+        statements.append({"Effect": "Allow", "Action": sorted(set(actions)), "Resource": resource})
     if delete and not allow_delete:
         statements.append({"Effect": "Deny", "Action": sorted(delete), "Resource": "*"})
         unscoped[DENY] = sorted(delete)
@@ -672,6 +837,12 @@ class Analysis:
     # With scoping: account, region, partition, scoped_count, unscoped_count, and
     # unscoped ({reason: [actions]}, every action left on "*"). None without scoping.
     scoping: Optional[Dict] = None
+    # Template mode: the transforms the template uses, each {"name", "actions", "resources"}:
+    # what CloudFormation needs to run it as a service role. Their actions are in ``allow``.
+    transforms: List[Dict] = field(default_factory=list)
+    # Template mode: custom resources (Custom::*, AWS::CloudFormation::CustomResource), each
+    # {"logical_id", "type"}. Their permissions are not in the policy.
+    skipped_resources: List[Dict] = field(default_factory=list)
 
     @property
     def policy_size(self) -> int:
@@ -701,6 +872,8 @@ class Analysis:
             "warnings": self.warnings,
             "scoping": self.scoping,
             "policy_size": self.policy_size,
+            "transforms": self.transforms,
+            "skipped_resources": self.skipped_resources,
         }
 
 
@@ -818,25 +991,91 @@ async def _permissions(resolver: _Resolver, resource_types, failures, scope: Opt
     return allow, delete, by_type, reference
 
 
+def _transform_grants(transforms: List[Dict], scope: Optional[Scope]) -> Tuple[List[Dict], Dict[str, List[str]]]:
+    """(Analysis.transforms entries, {action: resources}) for the template's transforms."""
+    entries = []
+    resources: List[str] = []
+    for t in transforms:
+        arn = transform_arn(t["name"], scope)
+        entries.append({"name": t["name"], "actions": [TRANSFORM_ACTION], "resources": [arn]})
+        resources.append(arn)
+    return entries, ({TRANSFORM_ACTION: sorted(set(resources))} if resources else {})
+
+
+def _transform_warnings(transforms: List[Dict], resources: List[Tuple[str, str, Dict]]) -> List[str]:
+    names = {t["name"] for t in transforms}
+    warnings = []
+    for t in transforms:
+        if t["name"] == "AWS::Include":
+            where = ", ".join(t["locations"]) or "each snippet's Location"
+            warnings.append(
+                f"AWS::Include: the resources in included snippets are not in the policy, and the role also needs "
+                f"s3:GetObject on {where}."
+            )
+        elif not t["name"].startswith("AWS::"):
+            warnings.append(
+                f"Transform {t['name']} is a macro: the policy allows {TRANSFORM_ACTION} on it, but not what its "
+                "function needs or the resources it adds."
+            )
+    if any(rtype.startswith(SAM_PREFIX) for _, rtype, _ in resources) and SAM_TRANSFORM not in names:
+        warnings.append(
+            f"The template has {SAM_PREFIX}* resources but no Transform: {SAM_TRANSFORM}; CloudFormation rejects it "
+            "without the transform."
+        )
+    return warnings
+
+
+def _skipped_warning(skipped: List[Dict]) -> List[str]:
+    if not skipped:
+        return []
+    listed = ", ".join(f"{r['logical_id']} ({r['type']})" for r in skipped[:10])
+    if len(skipped) > 10:
+        listed += f" and {len(skipped) - 10} more"
+    noun = "custom resource" if len(skipped) == 1 else "custom resources"
+    return [
+        f"Skipped {len(skipped)} {noun}: {listed}. cfn2iam can't tell what a custom resource needs, so the policy "
+        "has no permissions for it, such as lambda:InvokeFunction on its ServiceToken function or sns:Publish on "
+        "its topic."
+    ]
+
+
 def _finish(
-    resolver, resource_types, failures, allow, delete, by_type, allow_delete, scope=None, reference=None, **extra
+    resolver,
+    resource_types,
+    failures,
+    allow,
+    delete,
+    by_type,
+    allow_delete,
+    scope=None,
+    reference=None,
+    transforms=(),
+    extra_warnings=(),
+    **extra,
 ) -> Analysis:
-    warnings = resolver.warnings
+    warnings = resolver.warnings + list(extra_warnings)
     scoping = None
+    entries, fixed = _transform_grants(list(transforms), scope)
+    # A transform's action is needed to deploy at all: never deny it.
+    delete = set(delete) - set(fixed)
     if scope is None:
         policy = generate_policy_document(allow, delete, allow_delete)
+        for action, resources in fixed.items():
+            resource = resources[0] if len(resources) == 1 else resources
+            policy["Statement"].insert(1 if allow else 0, {"Effect": "Allow", "Action": [action], "Resource": resource})
     else:
-        policy, scoping, scope_warnings = _scoped_policy(allow, delete, allow_delete, scope, reference, by_type)
+        policy, scoping, scope_warnings = _scoped_policy(allow, delete, allow_delete, scope, reference, by_type, fixed)
         warnings = warnings + scope_warnings
     return Analysis(
         policy=policy,
         resource_types=sorted(resource_types),
-        allow=sorted(allow),
+        allow=sorted(set(allow) | set(fixed)),
         delete=sorted(delete),
         by_type=by_type,
         failures=failures,
         warnings=warnings + _size_warnings(policy),
         scoping=scoping,
+        transforms=entries,
         **extra,
     )
 
@@ -869,12 +1108,19 @@ async def analyze_template(
     :class:`ServiceReferenceError` is raised rather than falling back to ``"*"``.
     """
     scope = make_scope(account, region, partition)
-    resources = _template_resources(parse_template(template_text, template_format))
+    template = parse_template(template_text, template_format)
+    resources, skipped = _template_resources(template)
+    transforms = _template_transforms(template)
+    notes = {
+        "transforms": transforms,
+        "extra_warnings": _transform_warnings(transforms, resources) + _skipped_warning(skipped),
+        "skipped_resources": skipped,
+    }
     resolver = _Resolver(fetch_json, schema_fallback, published_schemas)
     failures: Dict[str, SchemaError] = {}
     if not resources:
         reference = _ServiceReference(fetch_json)  # nothing to scope, so nothing to fetch
-        return _finish(resolver, [], failures, set(), set(), {}, allow_delete, scope, reference)
+        return _finish(resolver, [], failures, set(), set(), {}, allow_delete, scope, reference, **notes)
 
     sam_types = sorted({rtype for _, rtype, _ in resources if rtype.startswith(SAM_PREFIX)})
     rules: Dict[str, Optional[SamRule]] = {}
@@ -907,6 +1153,7 @@ async def analyze_template(
         scope,
         reference,
         sam_resources=sam_resources,
+        **notes,
     )
 
 
