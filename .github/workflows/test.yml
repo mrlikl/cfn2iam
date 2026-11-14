@@ -163,6 +163,15 @@ jobs:
             cfn2iam "$GITHUB_WORKSPACE/samples/$template"
             python -I -c 'import glob, json; [f] = glob.glob("policy-*.json"); s = json.load(open(f))["Statement"]; assert s and all(x["Action"] for x in s), s; print(f, [(x["Effect"], len(x["Action"])) for x in s])'
           done
+      - name: Run the CLI on samples/ with resource scoping
+        # Also fetches the published Service Authorization Reference (servicereference/).
+        run: |
+          mkdir "$RUNNER_TEMP/scoped" && cd "$RUNNER_TEMP/scoped"
+          for template in cfn.json sam.yaml; do
+            rm -f policy-*.json
+            cfn2iam "$GITHUB_WORKSPACE/samples/$template" --account 123456789012 --region us-east-1
+            python -I -c 'import glob, json; [f] = glob.glob("policy-*.json"); s = json.load(open(f))["Statement"]; arns = [r for x in s if x["Effect"] == "Allow" for r in ([x["Resource"]] if isinstance(x["Resource"], str) else x["Resource"]) if r != "*"]; assert arns and all(r.count(":") >= 5 and "${" not in r for r in arns), s; assert all(x["Resource"] == "*" for x in s if x["Effect"] == "Deny"), s; print(f, len(s), "statements,", len(arns), "ARNs")'
+          done
 
   core:
     name: Core without CLI dependencies (CPython and Pyodide)

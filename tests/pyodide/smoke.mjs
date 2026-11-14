@@ -88,6 +88,35 @@ json.dumps(analysis.to_dict())
 lookup = await core.analyze_resource_type("AWS::Serverless::Function", fetch_json)
 assert lookup.resource_types == ["AWS::IAM::Role", "AWS::Lambda::Function"], lookup.resource_types
 
+# Resource scoping, as the page runs it when an account is entered.
+BACKEND.update({
+    "servicereference/index.json": {"services": {p: {"filename": f"{p}.json"} for p in ("s3", "iam", "lambda")}},
+    "servicereference/s3.json": {
+        "actions": {
+            "createbucket": {"name": "CreateBucket", "resources": ["bucket"]},
+            "deletebucket": {"name": "DeleteBucket", "resources": ["bucket"]},
+        },
+        "resources": {"bucket": {"arnFormats": ["arn:\${Partition}:s3:::\${BucketName}"]}},
+    },
+    "servicereference/iam.json": {
+        "actions": {"createrole": {"name": "CreateRole", "resources": ["role"]}},
+        "resources": {"role": {"arnFormats": ["arn:\${Partition}:iam::\${Account}:role/\${RoleNameWithPath}"]}},
+    },
+    "servicereference/lambda.json": {
+        "actions": {"createfunction": {"name": "CreateFunction", "resources": ["function"]}},
+        "resources": {"function": {"arnFormats": ["arn:\${Partition}:lambda:\${Region}:\${Account}:function:\${FunctionName}"]}},
+    },
+})
+scoped = await core.analyze_template(TEMPLATE, fetch_json, account="123456789012", region="eu-west-1")
+assert scoped.policy["Statement"] == [
+    {"Effect": "Allow", "Action": ["iam:CreateRole"], "Resource": "arn:aws:iam::123456789012:role/*"},
+    {"Effect": "Allow", "Action": ["lambda:CreateFunction"], "Resource": "arn:aws:lambda:eu-west-1:123456789012:function:*"},
+    {"Effect": "Allow", "Action": ["s3:CreateBucket"], "Resource": "arn:aws:s3:::*"},
+    {"Effect": "Deny", "Action": ["s3:DeleteBucket"], "Resource": "*"},
+], scoped.policy
+assert scoped.to_dict()["scoping"]["scoped_count"] == 3, scoped.scoping
+json.dumps(scoped.to_dict())
+
 cli_only = sorted(m for m in ("typer", "click", "boto3", "cfn2iam.app") if m in sys.modules)
 assert not cli_only, cli_only
 print(f"cfn2iam {version('cfn2iam')} core OK under Pyodide")

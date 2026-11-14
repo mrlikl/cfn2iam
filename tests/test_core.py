@@ -351,7 +351,10 @@ def test_to_dict_is_json_ready():
         "sam_resources",
         "sam",
         "warnings",
+        "scoping",
+        "policy_size",
     }
+    assert data["scoping"] is None  # no account given
     assert data["by_type"]["MyOrg::Private::Thing"] == {
         "allow": [],
         "delete": [],
