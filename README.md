@@ -39,6 +39,8 @@ This writes `policy-<random>.json` to the current directory:
 | `-c`, `--create-role` | Also create an IAM role CloudFormation can assume, with this policy inline (needs `cfn2iam[iam]` and AWS credentials) |
 | `-r`, `--role-name NAME` | Role name for `--create-role` (default `cfn2iam-<random>`) |
 | `-p`, `--permissions-boundary ARN` | Permissions boundary for the created role |
+| `--format policy\|json` | `policy` (default): the policy document. `json`: the policy plus the resource types, the actions each one needs, the SAM expansion and any skipped types, written to stdout unless `-o` is given; stdout then carries nothing else |
+| `-o`, `--output PATH` | Write to `PATH` instead of `policy-<random>.json`; `-` for stdout |
 | `--ignore-unknown` | Skip resource types found in neither the public schemas nor the CloudFormation registry, instead of failing |
 | `--registry` | Look up every resource type with CloudFormation `DescribeType` in your account instead of the published schemas (needs `cfn2iam[iam]` and AWS credentials) |
 | `--region REGION` | Region for CloudFormation registry lookups (default: your AWS config). With `--account`, also the region resources are scoped to (default: any region) |
@@ -54,6 +56,130 @@ cfn2iam template.yaml -c -r MyDeployRole       # create the role as well
 cfn2iam template.yaml -c -p arn:aws:iam::123456789012:policy/boundary
 cfn2iam template.yaml --account 123456789012 --region eu-west-1   # scope resources to one account and region
 ```
+
+## Use it in CI
+
+A policy generated once drifts as soon as the template changes. The check below runs on every pull request: the repository keeps a **baseline**, the policy the deploy role has (or the cfn2iam output it was built from), and each pull request regenerates the policy from the changed templates and compares the two. The pull request gets a comment saying which actions were added or are no longer needed, and the check fails when the templates now need actions the baseline doesn't grant, before a deploy fails on them.
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/iam.yml
+name: IAM permissions
+
+on:
+  pull_request:
+    paths: ["templates/**", "iam/deploy-policy.json"]
+
+permissions:
+  contents: read        # check out the templates
+  pull-requests: write  # the comment; without it, the report is in the job summary only
+
+jobs:
+  cfn2iam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mrlikl/cfn2iam@v0
+        with:
+          templates: templates/*.yaml
+          baseline: iam/deploy-policy.json
+```
+
+The first run finds no baseline, lists what the templates need, and prints the command that creates it (it doesn't fail unless `require-baseline: true`). Commit that file and give the deploy role the same policy, or one that grants at least as much.
+
+The action installs cfn2iam from its own files, not from PyPI, so the ref you pin is exactly the code that runs, with the dependency versions in its `uv.lock`. It sets up [uv](https://docs.astral.sh/uv/), which uses an installed Python 3.11+ or downloads one, so the job needs no `setup-python`. It needs network access to PyPI and to the schema host. It runs on Linux, macOS and Windows runners.
+
+Pin a release tag (`mrlikl/cfn2iam@v0.4.0`) or a commit SHA for a fixed version, or `@v0` to follow the 0.x releases. Dependabot updates both a tag and a SHA pin.
+
+| Input | Default | |
+|---|---|---|
+| `templates` | (required) | Template files, one per line: paths or globs (`**` for any depth), relative to the workspace. Their permissions are combined, as for one role that deploys every template |
+| `baseline` | none | Baseline policy file; several (one per line) combine, as for a role with several policies. Without one, the action lists what the templates need |
+| `fail-on-drift` | `true` | Fail when the templates need actions the baseline doesn't grant |
+| `comment` | `always` | `always`, `on-change` (comment only when something differs; an existing comment is still updated) or `never`. One comment per pull request, updated on each push |
+| `conditional` | `missing` | How to count actions the baseline grants only under a `Condition` or for specific resources: `missing` or `granted` (see [How the baseline is read](#how-the-baseline-is-read)) |
+| `allow-delete` | `false` | `-d`: allow the delete-only actions instead of denying them |
+| `ignore-unknown` | `false` | `--ignore-unknown`: skip resource types with no schema |
+| `require-baseline` | `false` | Fail when the baseline file doesn't exist yet |
+| `update-baseline` | `false` | Write the generated policy to the baseline file instead of failing on drift (needs one `baseline` file) |
+| `name` | none | Names the check when a workflow runs the action more than once; each name gets its own comment |
+| `account` | none | `--account`: scope resources to this 12-digit account ID (see [Resource scoping](#resource-scoping)) |
+| `region` | none | `--region`: the region resources are scoped to with `account`, and the region for registry lookups |
+| `partition` | none | `--partition`, for `account` (default `aws`); without `account` it is an error |
+| `registry-fallback` | `false` | Install `cfn2iam[iam]`, so types with no public schema (private or third-party) are looked up with CloudFormation `DescribeType`. Needs AWS credentials in the job |
+| `python-version` | uv's choice | Python for cfn2iam, 3.11 or later |
+| `github-token` | `github.token` | Token for the comment |
+
+| Output | |
+|---|---|
+| `drift` | `true` when the templates need actions the baseline doesn't grant |
+| `added-count` | Actions needed and not granted (0 without a baseline) |
+| `removed-count` | Baseline `Allow` entries that no needed action matches |
+| `conditional-count` | Needed actions the baseline grants only under a condition or for some resources |
+| `baseline-status` | `found`, `missing` (not created yet) or `none` (no `baseline` input) |
+| `policy-path` | The generated policy, all templates combined |
+| `report-path` | The report in Markdown, as in the job summary |
+| `commented`, `comment-url` | Whether the pull request comment was written, and its URL |
+| `error` | `true` when the check couldn't run (a template missing or unresolvable, an invalid baseline) |
+
+Every run writes the report to the job summary. On a pull request it also comments, like this:
+
+COMMENT_EXAMPLE
+
+**Accepting a change.** When a pull request needs new permissions on purpose, grant them to the deploy role and regenerate the baseline in the same pull request, so the change is reviewed with the template. The comment prints the exact commands; for one template:
+
+```bash
+cfn2iam templates/app.yaml -o iam/deploy-policy.json
+```
+
+For several, generate each and combine them:
+
+```bash
+cfn2iam templates/a.yaml -o /tmp/a.json
+cfn2iam templates/b.yaml -o /tmp/b.json
+cfn2iam diff /tmp/a.json /tmp/b.json -w iam/deploy-policy.json
+```
+
+If the baseline is a hand-written policy (with wildcards or conditions), edit it instead: regenerating replaces it. To regenerate it in CI instead, run the action with `update-baseline: true` and commit the file in a later step, for example from a `workflow_dispatch` workflow on the pull request's branch with `contents: write`. A push made with the workflow's `GITHUB_TOKEN` doesn't start new workflow runs, so the checks won't rerun on that commit until something else is pushed; check out with a GitHub App or personal access token if they must.
+
+**Forks and Dependabot.** Pull requests from forks, and Dependabot's, get a read-only token on `pull_request`, so the action can't comment there. It says so in a notice and the job summary, and the check itself still passes or fails as usual. Don't switch to `pull_request_target` to get a write token unless no step runs code from the pull request.
+
+**Other events.** On `push` (or any event without a pull request) the check runs and writes the job summary, without a comment.
+
+**Several stacks.** The templates in one run are combined, for one deploy role. When each stack has its own role and policy, run the action once per stack, each with its own `name`:
+
+```yaml
+      - uses: mrlikl/cfn2iam@v0
+        with: { name: network, templates: stacks/network.yaml, baseline: iam/network.json }
+      - uses: mrlikl/cfn2iam@v0
+        with: { name: app, templates: stacks/app/*.yaml, baseline: iam/app.json }
+```
+
+### Other CI systems
+
+The comparison is part of the CLI, so the same check runs anywhere:
+
+```bash
+pip install cfn2iam
+cfn2iam templates/app.yaml --format json -o /tmp/app.json
+cfn2iam diff /tmp/app.json --baseline iam/deploy-policy.json   # --format markdown for a merge request note
+```
+
+`cfn2iam diff GENERATED... [-b BASELINE]...` reads files that cfn2iam wrote (`--format json` output also says which resource types need each action) and combines several. `--format text|json|markdown` and `-o` set the report, `-w FILE` also writes the combined policy (to create or refresh a baseline), and `--conditional granted` counts conditional grants as granted. Its exit status: `0` when the baseline grants everything the templates need, `3` when it doesn't (permission drift), `1` on an error such as an unreadable file, `2` on a usage error. Generating the policy keeps exiting `1` when a resource type can't be resolved.
+
+### How the baseline is read
+
+The baseline can be a policy document (one statement or several), the output of `aws iam get-role-policy` or `aws iam get-policy-version`, or cfn2iam output. Each action the templates need is evaluated the way IAM would, for the resources the generated policy gives it:
+
+- Action names match case-insensitively, with `*` and `?` wildcards: `s3:*` and `ec2:Describe*` grant what they cover, and `"Action": "*"` grants everything.
+- An explicit `Deny` that covers an action makes it not granted, whatever allows it.
+- `NotAction` and `NotResource` are evaluated exactly: an `Allow` with `NotAction: iam:*` grants every action except IAM's.
+- A `Condition`, or a `Resource` narrower than what the generated policy needs (including policy variables), can't be checked from a template: whether a condition holds, or which resources CloudFormation creates, is only known at deploy time. Such an action is reported as **conditional**, with the statement that made it so. By default it counts as not granted, so the check fails closed; set `conditional: granted` (`--conditional granted`) if your conditions hold for deploys. A conditional `Deny` makes an action conditional too.
+- Resources: each action is checked on every resource the generated policy gives it. A baseline statement on `"*"` covers any ARN, so a baseline made without `--account` still covers a scoped policy. A baseline statement limited to ARNs covers a scoped ARN pattern only if it includes it (`arn:aws:sqs:*:123456789012:*` includes `arn:aws:sqs:us-east-1:123456789012:*`), and covers `"*"` only conditionally. Keep the baseline and the check on the same scoping options, or the comparison reports conditional grants.
+- "No longer needed" lists the baseline's `Allow` entries that no needed action matches, wildcards included. Delete-only changes (actions the generated policy denies) are listed separately and never count as drift.
 
 ## How it works
 

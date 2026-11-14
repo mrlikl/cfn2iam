@@ -163,6 +163,9 @@ jobs:
             cfn2iam "$GITHUB_WORKSPACE/samples/$template"
             python -I -c 'import glob, json; [f] = glob.glob("policy-*.json"); s = json.load(open(f))["Statement"]; assert s and all(x["Action"] for x in s), s; print(f, [(x["Effect"], len(x["Action"])) for x in s])'
           done
+          # The comparison, through the installed entry point: 0 for no drift.
+          cfn2iam "$GITHUB_WORKSPACE/samples/cfn.json" --format json -o cfn.json
+          cfn2iam diff cfn.json --baseline cfn.json
       - name: Run the CLI on samples/ with resource scoping
         # Also fetches the published Service Authorization Reference (servicereference/).
         run: |
@@ -223,11 +226,232 @@ jobs:
           npm install --no-save --no-audit --no-fund --ignore-scripts --prefix "$RUNNER_TEMP/pyodide" "pyodide@$PYODIDE_VERSION"
           node tests/pyodide/smoke.mjs "$RUNNER_TEMP/pyodide/node_modules/pyodide" dist/*.whl
 
+  # The GitHub Action (action.yml at the root), run as a user runs it, against samples/ and
+  # tests/fixtures/action/. Its token is read-only (contents: read, and this workflow is also
+  # called from publish.yml), so on a pull request the comment attempt is refused, which tests
+  # the fork and Dependabot path. action-comment.yml tests posting the comment.
+  #
+  # drift-baseline.json is a hand-written deploy role policy for samples/cfn.json: S3 and one
+  # unused SQS action, DynamoDB only under a condition, IAM only for some roles, no Lambda.
+  # Service wildcards keep the outcome stable when the weekly schema refresh adds actions.
+  action:
+    name: GitHub Action
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "First run: no baseline yet"
+        id: first
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: ${{ runner.temp }}/baselines/cfn.json
+          name: first run
+      - name: The first run explains and passes
+        env:
+          OUT: ${{ toJSON(steps.first.outputs) }}
+        run: |
+          echo "$OUT"
+          jq -e '.["baseline-status"] == "missing" and .drift == "false" and .error == "false" and .["added-count"] == "0" and .commented == "false"' <<< "$OUT"
+          grep -q 'Start checking' "$(jq -r '.["report-path"]' <<< "$OUT")"
+          jq -e '.Statement[0].Action | index("lambda:CreateFunction")' "$(jq -r '.["policy-path"]' <<< "$OUT")"
+          [ ! -e "$RUNNER_TEMP/baselines/cfn.json" ]
+
+      - name: "Accept: write the baseline"
+        id: accept
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: ${{ runner.temp }}/baselines/cfn.json
+          update-baseline: true
+          comment: never
+      - name: The baseline is the generated policy
+        env:
+          POLICY: ${{ steps.accept.outputs.policy-path }}
+        run: cmp "$POLICY" "$RUNNER_TEMP/baselines/cfn.json"
+
+      - name: "No drift: the baseline grants what the template needs"
+        id: same
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: ${{ runner.temp }}/baselines/cfn.json
+          comment: never
+          name: no drift
+      - name: Nothing changed
+        env:
+          OUT: ${{ toJSON(steps.same.outputs) }}
+        run: |
+          jq -e '.["baseline-status"] == "found" and .drift == "false" and .["added-count"] == "0" and .["removed-count"] == "0"' <<< "$OUT"
+          grep -q 'No permission changes' "$(jq -r '.["report-path"]' <<< "$OUT")"
+
+      - name: "Drift, reported without failing"
+        id: drift
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: tests/fixtures/action/drift-baseline.json
+          fail-on-drift: false
+          comment: never
+          name: drift
+      - name: The action reported the drift
+        env:
+          OUT: ${{ toJSON(steps.drift.outputs) }}
+        run: |
+          echo "$OUT"
+          jq -e '.drift == "true" and (.["added-count"] | tonumber) > 0 and .["removed-count"] == "1" and (.["conditional-count"] | tonumber) > 0' <<< "$OUT"
+          report=$(jq -r '.["report-path"]' <<< "$OUT")
+          # shellcheck disable=SC2016 # literal backticks
+          grep -q '`lambda:CreateFunction`' "$report"
+          grep -q 'TablesInOneRegion' "$report"
+          grep -q 'sqs' "$report"
+
+      - name: "Drift, failing the step"
+        id: drift-fail
+        continue-on-error: true
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: tests/fixtures/action/drift-baseline.json
+          comment: never
+      - name: The step failed, with its outputs set
+        env:
+          OUTCOME: ${{ steps.drift-fail.outcome }}
+          DRIFT: ${{ steps.drift-fail.outputs.drift }}
+        run: '[ "$OUTCOME" = failure ] && [ "$DRIFT" = true ]'
+
+      - name: "Several templates, with a glob: write the baseline"
+        id: multi-accept
+        uses: ./
+        with:
+          templates: |
+            samples/cfn.json
+            samples/*.yaml
+          baseline: ${{ runner.temp }}/baselines/all.json
+          update-baseline: true
+          comment: never
+      - name: "Several templates: check them against it"
+        id: multi
+        uses: ./
+        with:
+          templates: |
+            samples/cfn.json
+            samples/*.yaml
+          baseline: ${{ runner.temp }}/baselines/all.json
+          comment: never
+      - name: The policies were combined
+        env:
+          OUT: ${{ toJSON(steps.multi.outputs) }}
+        run: |
+          jq -e '.drift == "false" and .["added-count"] == "0"' <<< "$OUT"
+          jq -e '[.Statement[0].Action[] | select(startswith("lambda:") or startswith("states:"))] | map(split(":")[0]) | unique == ["lambda", "states"]' "$RUNNER_TEMP/baselines/all.json"
+          # shellcheck disable=SC2016 # literal backticks
+          grep -q 'Templates: `samples/cfn.json`, `samples/sam.yaml`' "$(jq -r '.["report-path"]' <<< "$OUT")"
+
+      - name: "Resource scoping: against the unscoped baseline"
+        id: scoped
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: ${{ runner.temp }}/baselines/cfn.json
+          account: "123456789012"
+          region: us-east-1
+          comment: never
+          name: scoped
+      - name: "Resource scoping: a scoped baseline"
+        id: scoped-accept
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: ${{ runner.temp }}/baselines/scoped.json
+          account: "123456789012"
+          region: us-east-1
+          update-baseline: true
+          comment: never
+      - name: "Resource scoping: the unscoped policy against the scoped baseline"
+        id: unscoped-vs-scoped
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: ${{ runner.temp }}/baselines/scoped.json
+          fail-on-drift: false
+          comment: never
+      - name: A "*" baseline covers scoped ARNs, and a scoped baseline grants "*" only conditionally
+        env:
+          SCOPED: ${{ toJSON(steps.scoped.outputs) }}
+          UNSCOPED: ${{ toJSON(steps.unscoped-vs-scoped.outputs) }}
+        run: |
+          jq -e '.drift == "false" and .["added-count"] == "0"' <<< "$SCOPED"
+          # shellcheck disable=SC2016 # literal backticks
+          grep -q 'Resources scoped to account `123456789012`, region `us-east-1`' "$(jq -r '.["report-path"]' <<< "$SCOPED")"
+          jq -e '[.Statement[] | select(.Effect == "Allow") | .Resource | if type == "string" then [.] else . end | .[] | select(startswith("arn:aws:"))] | length > 0' "$RUNNER_TEMP/baselines/scoped.json"
+          jq -e '.drift == "true" and (.["conditional-count"] | tonumber) > 0' <<< "$UNSCOPED"
+
+      - name: "Error: a template that does not exist"
+        id: no-template
+        continue-on-error: true
+        uses: ./
+        with:
+          templates: samples/missing.yaml
+          comment: never
+      - name: "Error: a resource type no schema knows"
+        id: unresolved
+        continue-on-error: true
+        uses: ./
+        with:
+          templates: tests/fixtures/action/unresolved.yaml
+          comment: never
+      - name: Both failed, and said why
+        env:
+          NO_TEMPLATE: ${{ toJSON(steps.no-template) }}
+          UNRESOLVED: ${{ toJSON(steps.unresolved) }}
+        run: |
+          jq -e '.outcome == "failure" and .outputs.error == "true"' <<< "$NO_TEMPLATE"
+          # shellcheck disable=SC2016 # literal backticks
+          grep -q 'Template `samples/missing.yaml` does not exist' "$(jq -r '.outputs["report-path"]' <<< "$NO_TEMPLATE")"
+          jq -e '.outcome == "failure" and .outputs.error == "true"' <<< "$UNRESOLVED"
+          grep -q 'MyOrg::Fake::Thing' "$(jq -r '.outputs["report-path"]' <<< "$UNRESOLVED")"
+
+  # The action on macOS and Windows: the install, paths, and the outputs.
+  action-os:
+    name: GitHub Action (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: accept
+        uses: ./
+        with:
+          templates: samples/*.yaml
+          baseline: ${{ runner.temp }}/baseline.json
+          update-baseline: true
+          comment: never
+      - id: check
+        uses: ./
+        with:
+          templates: samples/*.yaml
+          baseline: ${{ runner.temp }}/baseline.json
+          comment: never
+      - name: No drift
+        shell: bash
+        env:
+          OUT: ${{ toJSON(steps.check.outputs) }}
+        run: jq -e '.["baseline-status"] == "found" and .drift == "false"' <<< "$OUT"
+
   # One stable check for branch protection to require, however the matrices above change.
   ok:
     name: All checks passed
     if: always()
-    needs: [lint, test, iam, build, wheel, core]
+    needs: [lint, test, iam, build, wheel, core, action, action-os]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

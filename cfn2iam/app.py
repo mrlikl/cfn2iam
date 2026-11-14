@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from enum import StrEnum
 from importlib.metadata import version
 from typing import Dict, Optional
 
@@ -21,6 +22,11 @@ from .core import NotFound, SchemaError, UnknownResourceType, generate_policy_do
 
 SCHEMA_BASE_URL = "https://mrlikl.github.io/cfn2iam/backend"
 MAX_WORKERS = 8
+
+
+class OutputFormat(StrEnum):
+    policy = "policy"
+    json = "json"
 
 
 def version_callback(value: bool):
@@ -176,7 +182,7 @@ def create_iam_role(policy_document, role_name, permissions_boundary=None):
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
 
-@app.command()
+@app.command(epilog="Compare policies with a baseline: cfn2iam diff --help")
 def main(
     template_path: str = typer.Argument(help="Path to the CloudFormation template file"),
     allow_delete: bool = typer.Option(
@@ -190,6 +196,17 @@ def main(
     ),
     permissions_boundary: str = typer.Option(
         None, "-p", "--permissions-boundary", help="ARN of the permissions boundary to attach to the role"
+    ),
+    output_format: OutputFormat = typer.Option(
+        OutputFormat.policy,
+        "--format",
+        help="What to write: the policy document, or json: the policy with the resource types and the actions each needs",
+    ),
+    output: Optional[str] = typer.Option(
+        None,
+        "-o",
+        "--output",
+        help="File to write, or - for stdout (default: policy-<random>.json for --format policy, stdout for json)",
     ),
     ignore_unknown: bool = typer.Option(
         False,
@@ -216,6 +233,9 @@ def main(
     ),
     version: Optional[bool] = typer.Option(None, "--version", callback=version_callback, help="Show version and exit"),
 ):
+    to_stdout = output == "-" or (output is None and output_format == OutputFormat.json)
+    # Keep stdout for the document when it goes there, and always for --format json.
+    messages = sys.stderr if to_stdout or output_format == OutputFormat.json else sys.stdout
     try:
         if registry and not _has_boto3():
             print('Error: --registry needs boto3. Install with: pip install "cfn2iam[iam]"', file=sys.stderr)
@@ -239,7 +259,7 @@ def main(
             print(f"Warning: {warning}", file=sys.stderr)
         resource_types = analysis.resource_types
         if not resource_types:
-            print("No resource types found in the template.")
+            print("No resource types found in the template.", file=messages)
             sys.exit(1)
         failures = analysis.failures
         skipped = {t: e for t, e in failures.items() if ignore_unknown and isinstance(e, UnknownResourceType)}
@@ -260,18 +280,26 @@ def main(
         if analysis.scoping is not None:
             print(scoping_summary(analysis.scoping), file=sys.stderr)
         policy_document = analysis.policy
-        file_path = f"policy-{generate_random_hash()}.json"
-        with open(file_path, "w") as f:
-            json.dump(policy_document, f, indent=2)
-        print(f"Generated IAM Policy Document to {file_path}")
+        if output_format == OutputFormat.json:
+            document = {"template": template_path, "allow_delete": allow_delete, **analysis.to_dict()}
+        else:
+            document = policy_document
+        if to_stdout:
+            json.dump(document, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            file_path = output or f"policy-{generate_random_hash()}.json"
+            with open(file_path, "w") as f:
+                json.dump(document, f, indent=2)
+            print(f"Generated IAM Policy Document to {file_path}", file=messages)
         if create_role:
             role_name = role_name or f"cfn2iam-{generate_random_hash()}"
             role_arn = create_iam_role(policy_document, role_name, permissions_boundary)
             if not role_arn:
                 sys.exit(1)
-            print(f"Successfully created IAM role: {role_arn}")
+            print(f"Successfully created IAM role: {role_arn}", file=messages)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=messages)
         sys.exit(1)
 
 

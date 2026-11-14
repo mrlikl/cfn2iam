@@ -1,0 +1,30 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Storage",
+      "Effect": "Allow",
+      "Action": ["s3:*", "sqs:CreateQueue"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TablesInOneRegion",
+      "Effect": "Allow",
+      "Action": "dynamodb:*",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "eu-west-1" } }
+    },
+    {
+      "Sid": "AppRoles",
+      "Effect": "Allow",
+      "Action": "iam:*",
+      "Resource": "arn:aws:iam::*:role/app-*"
+    },
+    {
+      "Sid": "NoBucketPolicies",
+      "Effect": "Deny",
+      "Action": "s3:PutBucketPolicy",
+      "Resource": "*"
+    }
+  ]
+}

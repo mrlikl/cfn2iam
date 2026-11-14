@@ -33,7 +33,7 @@ Issues = "https://github.com/mrlikl/cfn2iam/issues"
 "Web version" = "https://mrlikl.github.io/cfn2iam/"
 
 [project.scripts]
-cfn2iam = "cfn2iam.app:app"
+cfn2iam = "cfn2iam.cli:main"
 
 [tool.hatch.version]
 source = "vcs"
@@ -68,6 +68,10 @@ ignore = [
     "UP006", "UP035",  # keep typing.Dict/List/Tuple, the annotation style used throughout
     "UP007", "UP045",  # likewise typing.Optional/Union
 ]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer declares options as parameter defaults.
+extend-immutable-calls = ["typer.Argument", "typer.Option"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

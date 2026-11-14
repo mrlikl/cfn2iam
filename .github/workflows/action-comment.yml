@@ -1,0 +1,65 @@
+name: Action comment
+
+# The GitHub Action's pull request comment, which needs a token that can write to pull requests.
+# Kept out of test.yml, which publish.yml calls with a read-only token: a called workflow can't
+# ask for more. Runs the drift fixture twice under one name, and checks that the second run
+# updated the first run's comment instead of adding one. Pull requests from forks and from
+# Dependabot get a read-only token, so there the check is that the action fell back to the
+# job summary without failing.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: action-comment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  comment:
+    name: Pull request comment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: first
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: tests/fixtures/action/drift-baseline.json
+          fail-on-drift: false
+          name: self-test (expected drift)
+      - id: second
+        uses: ./
+        with:
+          templates: samples/cfn.json
+          baseline: tests/fixtures/action/drift-baseline.json
+          fail-on-drift: false
+          name: self-test (expected drift)
+      - name: One comment, updated in place
+        env:
+          WRITABLE: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' }}
+          FIRST: ${{ toJSON(steps.first.outputs) }}
+          SECOND: ${{ toJSON(steps.second.outputs) }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          jq -e '.drift == "true"' <<< "$FIRST"
+          if [ "$WRITABLE" != true ]; then
+            echo "Read-only token: the action must have skipped the comment."
+            jq -e '.commented == "false"' <<< "$SECOND"
+            exit 0
+          fi
+          jq -e '.commented == "true"' <<< "$FIRST"
+          jq -e '.commented == "true"' <<< "$SECOND"
+          [ "$(jq -r '.["comment-url"]' <<< "$FIRST")" = "$(jq -r '.["comment-url"]' <<< "$SECOND")" ]
+          marker='<!-- cfn2iam-action:self-test (expected drift) -->'
+          count=$(gh api --paginate "repos/$GH_REPO/issues/$PR/comments" --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | wc -l)
+          echo "Comments with the marker: $count"
+          [ "$count" -eq 1 ]
